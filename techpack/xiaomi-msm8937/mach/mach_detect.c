@@ -17,6 +17,7 @@ typedef struct xiaomi_msm8937_mach_info {
 static const xiaomi_msm8937_mach_info_t xiaomi_msm8937_mach_table[XIAOMI_MSM8937_MACH_MAX] = {
 	// No Family
 	[XIAOMI_MSM8937_MACH_PRADA] = {XIAOMI_MSM8937_MACH_FAMILY_UNKNOWN, "xiaomi,prada", "prada", "Redmi 4 (Standard)"},
+	[XIAOMI_MSM8937_MACH_PEPITO] = {XIAOMI_MSM8937_MACH_FAMILY_UNKNOWN, "xiaomi,pepito", "pepito", "Palm PVG100"},
 
 	// Family ULYSSE
 	[XIAOMI_MSM8937_MACH_UGG] = {XIAOMI_MSM8937_MACH_FAMILY_ULYSSE, "xiaomi,ugg", "ugg", "Redmi Note 5A / Y1 Prime"},

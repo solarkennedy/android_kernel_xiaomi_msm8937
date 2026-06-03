@@ -78,4 +78,10 @@ config MACH_XIAOMI_UGG
 	help
 	  Support for Xiaomi Redmi Note 5A / Y1 Prime (ugg).
 
+config MACH_XIAOMI_PEPITO
+	bool "Palm PVG100 (pepito)"
+	depends on ARCH_MSM8940
+	help
+	  Support for Palm PVG100 (pepito).
+
 endmenu
