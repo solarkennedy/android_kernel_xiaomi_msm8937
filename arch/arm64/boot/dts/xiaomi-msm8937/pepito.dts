@@ -1,0 +1,82 @@
+/*
+ * Copyright (c) 2015-2016, 2018, The Linux Foundation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+/dts-v1/;
+
+#include "common/include/config.h"
+
+#include "qcom/msm8940.dtsi"
+#include "qcom/msm8940-pmi8937.dtsi"
+
+#include "common/fragments/delete-msm89x7-camera-sensor-mtp.dtsi"
+#include "common/fragments/qti-haptics.dtsi"
+#include "common/fragments/restore-old-msm8937-camera-pinctrl.dtsi"
+
+#include "common/common.dtsi"
+#include "pepito/pepito.dtsi"
+
+/ {
+	model = "Qualcomm Technologies, Inc. MSM8940-PMI8937 Palm PVG100";
+	compatible = "qcom,msm8940-pmi8937", "qcom,msm8940", "qcom,pmi8937", "xiaomi,pepito";
+	qcom,board-id = <0xaa000008 0x00 0x08 0x00>;
+	qcom,pmic-id = <0x10019 0x20011 0x0 0x0>;
+
+#ifndef MI8937_V2
+	xiaomi,series = "pepito";
+	xiaomi,device = "pepito";
+#endif
+};
+
+/*
+ * Stock pepito TZ implements only the old downstream SMMU contract
+ * (compatible "qcom,msm-smmu-v2", numeric qcom,iommu-secure-id, explicit
+ * per-master CB children). It does NOT implement the qsmmu-v500 / static-CB
+ * handoff the Lineage DTS assumes. Removing tz-device-id and enable-static-cb
+ * got us past the initial PS_HOLD reset at 1.8s, but the qsmmu-v500 driver
+ * then proceeds into arm_smmu_device_reset() which writes sCR0 — also a
+ * TZ-owned register on stock firmware — triggering a second PS_HOLD reset
+ * at ~2.0s. We cannot thread this needle from DTS without disabling the
+ * driver entirely; the new-style driver fundamentally wants to own these
+ * SMMUs and stock TZ will not permit that.
+ *
+ * Disable both SMMUs so masters fall back to direct physical DMA via
+ * swiotlb / coherent allocations. Trade-off documented in PLAN.md Phase 3.1b.
+ */
+&apps_iommu {
+	status = "disabled";
+};
+
+&kgsl_smmu {
+	status = "disabled";
+};
+
+/*
+ * BLSP1 QUP2 (i2c_2 @ 0x78b6000) is enabled by vendor-legacy/qcom/
+ * msm8937-audio.dtsi for the WSA881x speaker codecs. Lineage's
+ * common/audio.dtsi then /delete-node/s those codec children. Pepito
+ * doesn't use WSA codecs (uses the internal PMIC codec) and doesn't
+ * have bhy/wusb3801 on this bus in the Lineage tree (stock pepito did,
+ * but Lineage's sensor/USB-C stack is different).
+ *
+ * Result: i2c_2 is enabled with ZERO children to drive. The i2c-msm-v2
+ * driver still runs hardware init at probe time, and that init hangs
+ * (likely in BAM/AXI bus voting setup, despite qcom,disable-dma being
+ * set — see really_probe.md issue A). Boot stalls at ~7.28s.
+ *
+ * Disable i2c_2 entirely since nothing in our DTS uses it. If we
+ * later need bhy or wusb3801 on pepito, re-enable here and add the
+ * appropriate child nodes.
+ */
+&i2c_2 {
+	status = "disabled";
+};

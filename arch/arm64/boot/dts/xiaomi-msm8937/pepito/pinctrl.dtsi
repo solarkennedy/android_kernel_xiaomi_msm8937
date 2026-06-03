@@ -1,0 +1,49 @@
+/* Atmel touch controller pinctrl — override base msm8937-pinctrl config */
+&ts_int_active {
+	config {
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
+	};
+};
+
+&ts_int_suspend {
+	config {
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
+	};
+};
+
+&ts_reset_active {
+	config {
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+};
+
+&ts_reset_suspend {
+	config {
+		drive-strength = <2>;
+		bias-disable;
+		output-low;
+	};
+};
+
+&tlmm {
+	/* Volume up key pinctrl */
+	key_vol_up_default: key_vol_up_default {
+		mux {
+			pins = "gpio91";
+			function = "gpio";
+		};
+
+		config {
+			pins = "gpio91";
+			drive-strength = <2>;
+			bias-pull-up;
+			input-enable;
+		};
+	};
+};
