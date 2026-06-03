@@ -7,6 +7,7 @@ dtb-$(CONFIG_MACH_XIAOMI_SANTONI) += santoni.dtb
 dtb-$(CONFIG_MACH_XIAOMI_TIARE) += tiare.dtb
 dtb-$(CONFIG_MACH_XIAOMI_UGGLITE) += ugglite.dtb
 dtb-$(CONFIG_MACH_XIAOMI_UGG) += ugg.dtb
+dtb-$(CONFIG_MACH_XIAOMI_PEPITO) += pepito.dtb
 
 # old mi8937
 dtb-$(CONFIG_MACH_XIAOMI_ROVA) += riva.dtb
