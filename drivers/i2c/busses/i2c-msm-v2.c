@@ -282,13 +282,21 @@ static int i2c_msm_qup_sw_reset(struct i2c_msm_ctrl *ctrl)
 {
 	int ret;
 
+	pr_info("i2c-msm-v2 bringup: %s sw_reset entry, base=%p\n",
+		dev_name(ctrl->dev), ctrl->rsrcs.base);
 	writel_relaxed(1, ctrl->rsrcs.base + QUP_SW_RESET);
+	pr_info("i2c-msm-v2 bringup: %s sw_reset writel returned\n",
+		dev_name(ctrl->dev));
 	/*
 	 * Ensure that QUP that reset state is written before waiting for a the
 	 * reset state to be valid.
 	 */
 	wmb();
+	pr_info("i2c-msm-v2 bringup: %s sw_reset wmb done\n",
+		dev_name(ctrl->dev));
 	ret = i2c_msm_qup_state_wait_valid(ctrl, QUP_STATE_RESET, false);
+	pr_info("i2c-msm-v2 bringup: %s sw_reset wait_valid done (ret=%d)\n",
+		dev_name(ctrl->dev), ret);
 	if (ret) {
 		if (atomic_read(&ctrl->xfer.is_active))
 			ctrl->xfer.err = I2C_MSM_ERR_CORE_CLK;
@@ -2930,18 +2938,24 @@ static int i2c_msm_probe(struct platform_device *pdev)
 	if (ret)
 		goto clk_err;
 
+	/* TEMP bring-up: pinpoint which step hangs on pepito. */
+	pr_info("i2c-msm-v2 bringup: %s clk_init done\n", dev_name(&pdev->dev));
+
 	/* vote for clock to enable reading the version number off the HW */
 	i2c_msm_clk_path_vote(ctrl);
+	pr_info("i2c-msm-v2 bringup: %s clk_path_vote done\n", dev_name(&pdev->dev));
 
 	ret = i2c_msm_pm_clk_prepare(ctrl);
 	if (ret)
 		goto clk_err;
+	pr_info("i2c-msm-v2 bringup: %s clk_prepare done\n", dev_name(&pdev->dev));
 
 	ret = i2c_msm_pm_clk_enable(ctrl);
 	if (ret) {
 		i2c_msm_pm_clk_unprepare(ctrl);
 		goto clk_err;
 	}
+	pr_info("i2c-msm-v2 bringup: %s clk_enable done\n", dev_name(&pdev->dev));
 
 	/*
 	 * reset the core before registering for interrupts. This solves an
@@ -2950,20 +2964,37 @@ static int i2c_msm_probe(struct platform_device *pdev)
 	ret = i2c_msm_qup_sw_reset(ctrl);
 	if (ret)
 		dev_err(ctrl->dev, "error error on qup software reset\n");
+	pr_info("i2c-msm-v2 bringup: %s sw_reset done (ret=%d)\n", dev_name(&pdev->dev), ret);
 
-	i2c_msm_pm_clk_disable(ctrl);
-	i2c_msm_pm_clk_unprepare(ctrl);
-	i2c_msm_clk_path_unvote(ctrl);
+	/*
+	 * TEMP bring-up hack: do NOT disable iface_clk/core_clk after probe.
+	 * On 4.19 + earlycon-only console, dropping our CCF vote on
+	 * GCC_BLSP1_AHB_CLK drops the reference count to 0 (the real
+	 * msm_serial driver hasn't probed yet to hold its own vote), which
+	 * gates off the BLSP1 AHB clock. That kills the UART at 0x78b0000
+	 * — the kernel keeps running but no further console output appears,
+	 * which we'd been interpreting as a hang. Leave the clock voted-on
+	 * through probe; runtime PM will manage it later.
+	 *
+	 * i2c_msm_pm_clk_disable(ctrl);
+	 * i2c_msm_pm_clk_unprepare(ctrl);
+	 * i2c_msm_clk_path_unvote(ctrl);
+	 */
+	pr_info("i2c-msm-v2 bringup: %s clk_unvote SKIPPED (BLSP1_AHB pinned on)\n",
+		dev_name(&pdev->dev));
 
 	ret = i2c_msm_rsrcs_gpio_pinctrl_init(ctrl);
 	if (ret)
 		goto err_no_pinctrl;
+	pr_info("i2c-msm-v2 bringup: %s pinctrl_init done\n", dev_name(&pdev->dev));
 
 	i2c_msm_pm_rt_init(ctrl->dev);
+	pr_info("i2c-msm-v2 bringup: %s pm_rt_init done\n", dev_name(&pdev->dev));
 
 	ret = i2c_msm_rsrcs_irq_init(pdev, ctrl);
 	if (ret)
 		goto irq_err;
+	pr_info("i2c-msm-v2 bringup: %s irq_init done\n", dev_name(&pdev->dev));
 
 	i2c_msm_dbgfs_init(ctrl);
 
