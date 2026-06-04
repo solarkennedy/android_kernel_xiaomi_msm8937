@@ -500,9 +500,7 @@ static int really_probe(struct device *dev, struct device_driver *drv)
 		return ret;
 
 	atomic_inc(&probe_count);
-	/* TEMP bring-up debug: surface every probe-start so a stuck probe is
-	 * named in the serial log. Revert to pr_debug once boot is stable. */
-	pr_info("bus: '%s': %s: probing driver %s with device %s\n",
+	pr_debug("bus: '%s': %s: probing driver %s with device %s\n",
 		drv->bus->name, __func__, drv->name, dev_name(dev));
 	if (!list_empty(&dev->devres_head)) {
 		dev_crit(dev, "Resources present before probing\n");
