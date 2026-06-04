@@ -16,6 +16,8 @@
 #include "gpio-keys.dtsi"
 #include "display.dtsi"
 #include "battery_usb.dtsi"
+#include "audio.dtsi"
+#include "camera.dtsi"
 #include "misc.dtsi"
 
 / {
