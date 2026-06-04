@@ -1333,7 +1333,19 @@ void iommu_set_fault_handler(struct iommu_domain *domain,
 					iommu_fault_handler_t handler,
 					void *token)
 {
-	BUG_ON(!domain);
+	/*
+	 * TEMP bring-up: pepito's SMMUs are disabled (PLAN.md 3.1b), so
+	 * iommu_get_domain_for_dev() returns NULL for many drivers. The
+	 * original BUG_ON here was hit by msm_vidc and cam_smmu before
+	 * they were DTS-disabled. There may be additional callers we
+	 * haven't hit yet; soften BUG_ON to WARN_ON to avoid kernel
+	 * panics on any further NULL-domain calls. The fault handler
+	 * simply isn't installed, which is fine since IOMMU is disabled.
+	 *
+	 * Revert to BUG_ON once SMMU is brought up.
+	 */
+	if (WARN_ON_ONCE(!domain))
+		return;
 
 	domain->handler = handler;
 	domain->handler_token = token;
