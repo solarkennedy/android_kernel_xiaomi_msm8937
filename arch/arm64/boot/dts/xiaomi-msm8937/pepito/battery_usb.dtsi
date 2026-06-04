@@ -1,0 +1,61 @@
+/*
+ * Pepito battery / charger / fuel-gauge tuning.
+ *
+ * Mirrors the 4.9 pepito bring-up DTS (Phase 0 hardware-validated):
+ *   - Three battery profiles in qcom,battery-data: stock BYD (pepito
+ *     default), itech 3000 mAh and ascent 3450 mAh (id-range matched).
+ *   - qpnp_smbcharger tuned for the Palm hardware (float 4.4V, Palm
+ *     thermal-mitigation table, timeouts, JEITA hard-limit).
+ *   - qpnp_fg with Palm-specific JEITA temperature thresholds and
+ *     fuel-gauge tuning (iterm 200 mA, cutoff 3.35 V, vbat diff 200 mV,
+ *     ext-sense, capacity-learning-feedback, hold-soc-while-full).
+ *   - WLED OVP 17.8 V and 3-string config matching the FT8613 panel
+ *     backlight.
+ *
+ * qcom,chg-led-sw-controls and dpdm-supply are already set by
+ * msm8940-pmi8950.dtsi — not repeated here.
+ */
+/ {
+	pepito_batterydata: qcom,battery-data {
+		qcom,batt-id-range-pct = <15>;
+		#include "qcom/batterydata-itech-3000mah.dtsi"
+		#include "qcom/batterydata-ascent-3450mAh.dtsi"
+		#include "batterydata-byd-default-pepito.dtsi"
+	};
+};
+
+&qpnp_smbcharger {
+	status = "okay";
+	qcom,battery-data = <&pepito_batterydata>;
+	qcom,float-voltage-mv = <4400>;
+	qcom,thermal-mitigation = <700 600 500 0>;
+	qcom,charging-timeout-mins = <1536>;
+	qcom,precharging-timeout-mins = <48>;
+	qcom,charge-unknown-battery;
+	qcom,skip-usb-suspend-for-fake-battery;
+	qcom,jeita-temp-hard-limit = <1>;
+	qcom,override-usb-current;
+};
+
+&qpnp_fg {
+	qcom,battery-data = <&pepito_batterydata>;
+	qcom,fg-iterm-ma = <200>;
+	qcom,fg-cutoff-voltage-mv = <3350>;
+	qcom,resume-soc-raw = <253>;
+	qcom,vbat-estimate-diff-mv = <200>;
+	qcom,capacity-learning-feedback;
+	qcom,hold-soc-while-full;
+	qcom,irq-volt-empty-mv = <3000>;
+	qcom,ext-sense-type;
+	qcom,cold-bat-decidegc = <0>;
+	qcom,cool-bat-decidegc = <100>;
+	qcom,warm-bat-decidegc = <450>;
+	qcom,hot-bat-decidegc = <540>;
+	qcom,cold-hot-jeita-hysteresis = <10 10>;
+	qcom,cool-warm-jeita-hysteresis = <10 10>;
+};
+
+&wled {
+	qcom,ovp-mv = <17800>;
+	qcom,led-strings-list = [00 01 02];
+};

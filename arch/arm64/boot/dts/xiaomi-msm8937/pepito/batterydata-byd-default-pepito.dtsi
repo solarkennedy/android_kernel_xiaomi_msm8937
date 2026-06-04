@@ -1,0 +1,55 @@
+/* Default/demo battery profile for Palm PVG100 (Pepito).
+ * Used when BMS cannot identify the installed battery by ID resistor.
+ * Source: stock pepito.dts qcom,tcl_demo_800mah_pepito8940 node.
+ */
+qcom,byd-default-pepito {
+	qcom,default-battery-type;
+	qcom,max-voltage-uv = <4400000>;
+	qcom,nom-batt-capacity-mah = <800>;
+	qcom,batt-id-kohm = <18>;
+	qcom,battery-beta = <3435>;
+	qcom,thermal-coefficients = [c2 86 bb 50 cf 37];
+	qcom,fastchg-current-ma = <700>;
+	qcom,battery-type = "byd";
+	qcom,fg-cc-cv-threshold-mv = <4390>;
+	qcom,chg-rslow-comp-c1 = <5276595>;
+	qcom,chg-rslow-comp-c2 = <12419180>;
+	qcom,chg-rs-to-rslow = <1986597>;
+	qcom,chg-rslow-comp-thr = <0xC9>;
+	qcom,checksum = <0xB88A>;
+	qcom,gui-version = "PMI8950GUI - 2.0.0.16";
+	qcom,fg-profile-data = [
+		C5 83 24 77
+		B0 7B 41 74
+		5B 83 75 6C
+		A1 88 58 94
+		42 82 9A 98
+		62 B6 EF C1
+		52 0F F7 83
+		06 7D E2 80
+		3B 76 4E 83
+		5A 70 12 71
+		3B 85 37 82
+		2A 9A 66 BD
+		5F CA 58 0C
+		1C 03 09 62
+		14 70 63 FF
+		03 35 80 3C
+		5E 34 00 00
+		D9 45 5D 30
+		1D 36 00 00
+		00 00 00 00
+		00 00 00 00
+		F2 71 73 71
+		47 7F BF 5F
+		9F 6E 84 60
+		6D 60 96 72
+		4A 6C F9 43
+		D4 5C EC A1
+		2C FF 70 B6
+		6E A0 71 0C
+		28 00 FF 36
+		F0 11 30 03
+		00 00 00 0C
+	];
+};

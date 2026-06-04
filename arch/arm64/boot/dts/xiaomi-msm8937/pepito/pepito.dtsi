@@ -14,6 +14,8 @@
 #include "pinctrl.dtsi"
 #include "touchscreen.dtsi"
 #include "gpio-keys.dtsi"
+#include "display.dtsi"
+#include "battery_usb.dtsi"
 #include "misc.dtsi"
 
 / {
