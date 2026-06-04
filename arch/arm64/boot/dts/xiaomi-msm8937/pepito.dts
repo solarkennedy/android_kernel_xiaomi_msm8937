@@ -67,20 +67,19 @@
 
 /*
  * BLSP1 QUP2 (i2c_2 @ 0x78b6000) is enabled by vendor-legacy/qcom/
- * msm8937-audio.dtsi for the WSA881x speaker codecs. Lineage's
- * common/audio.dtsi then /delete-node/s those codec children. Pepito
- * doesn't use WSA codecs (uses the internal PMIC codec) and doesn't
- * have bhy/wusb3801 on this bus in the Lineage tree (stock pepito did,
- * but Lineage's sensor/USB-C stack is different).
+ * msm8937-audio.dtsi for the WSA881x speaker codecs.  Lineage's
+ * common/audio.dtsi then /delete-node/s those codec children, and
+ * pepito has no other consumers on this bus — stock 4.9 pepito DTS
+ * leaves &i2c_2 untouched (no wusb3801, no sensors, nothing).  USB-C
+ * orientation on pepito is handled internally by the PMI8950 USBIN
+ * block, not a discrete CC controller.
  *
- * Result: i2c_2 is enabled with ZERO children to drive. The i2c-msm-v2
- * driver still runs hardware init at probe time, and that init hangs
- * (likely in BAM/AXI bus voting setup, despite qcom,disable-dma being
- * set — see really_probe.md issue A). Boot stalls at ~7.28s.
+ * With ZERO children to drive, the i2c-msm-v2 driver still runs HW
+ * init at probe time and hangs there (likely in BAM/AXI bus-voting
+ * setup, despite qcom,disable-dma being set).  Boot stalls at ~7.28s.
  *
- * Disable i2c_2 entirely since nothing in our DTS uses it. If we
- * later need bhy or wusb3801 on pepito, re-enable here and add the
- * appropriate child nodes.
+ * Disable the bus entirely.  Re-enable here and add child nodes only
+ * if some future addition (smart-amp, sensor, etc.) actually needs it.
  */
 &i2c_2 {
 	status = "disabled";

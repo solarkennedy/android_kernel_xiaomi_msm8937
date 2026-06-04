@@ -12,8 +12,9 @@
  *   - WLED OVP 17.8 V and 3-string config matching the FT8613 panel
  *     backlight.
  *
- * qcom,chg-led-sw-controls and dpdm-supply are already set by
- * msm8940-pmi8950.dtsi — not repeated here.
+ * USB plumbing (&usb_otg extcon, dpdm-supply, chg-led-sw-controls) is
+ * already set by vendor-legacy/qcom/msm8940-pmi8950.dtsi, matching
+ * what stock 4.9 pepito DTS sets explicitly — not repeated here.
  */
 / {
 	pepito_batterydata: qcom,battery-data {
