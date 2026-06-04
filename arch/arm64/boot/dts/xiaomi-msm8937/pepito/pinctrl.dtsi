@@ -1,4 +1,4 @@
-/* Atmel touch controller pinctrl — override base msm8937-pinctrl config */
+/* FocalTech FTS touch controller pinctrl — override base msm8937-pinctrl config */
 &ts_int_active {
 	config {
 		drive-strength = <2>;

@@ -1,0 +1,102 @@
+/*
+ * Pepito display wiring — FT8613 720p video-mode DSI panel.
+ *
+ * Pepito doesn't pull in qcom/msm8937-mdss-panels.dtsi (which would
+ * drag along 17 unrelated panel timing files for other Mi8937
+ * variants), so we define the panel power-supply table here.  The
+ * voltage windows match Phase 0 hardware validation.  msm8940-pmi8950
+ * already wires PMI8950's lab/ibb regulators into mdss_dsi0.
+ *
+ * Then:
+ *   - Pull in the panel timing definitions (panel/dsi-panel-ft8613-*.dtsi).
+ *   - Wire each panel node's qcom,panel-supply-entries to the local
+ *     dsi_panel_pwr_supply_pepito.
+ *   - Select the v2 (1280p) FT8613 panel on mdss_dsi0, force LDO mode
+ *     on the DSI PHY regulator (the PHY otherwise initialises in DCDC
+ *     mode — works while inheriting bootloader cont_splash state but
+ *     fails the first time the kernel re-initialises the PHY itself
+ *     after a sleep/wake cycle, see Phase 0 project_display_sleep_wake
+ *     memory and the 4.9 pepito.dtsi comment), and wire reset /
+ *     backlight-enable / panel-enable GPIOs.
+ *   - Disable mdss_dsi1 — pepito only uses the first DSI controller.
+ */
+
+&soc {
+	dsi_panel_pwr_supply_pepito: dsi_panel_pwr_supply_pepito {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		qcom,panel-supply-entry@0 {
+			reg = <0>;
+			qcom,supply-name = "vdd";
+			qcom,supply-min-voltage = <2850000>;
+			qcom,supply-max-voltage = <2850000>;
+			qcom,supply-enable-load = <100000>;
+			qcom,supply-disable-load = <100>;
+		};
+
+		qcom,panel-supply-entry@1 {
+			reg = <1>;
+			qcom,supply-name = "vddio";
+			qcom,supply-min-voltage = <1800000>;
+			qcom,supply-max-voltage = <1800000>;
+			qcom,supply-enable-load = <100000>;
+			qcom,supply-disable-load = <100>;
+		};
+
+		qcom,panel-supply-entry@2 {
+			reg = <2>;
+			qcom,supply-name = "lab";
+			qcom,supply-min-voltage = <4600000>;
+			qcom,supply-max-voltage = <6000000>;
+			qcom,supply-enable-load = <100000>;
+			qcom,supply-disable-load = <100>;
+		};
+
+		qcom,panel-supply-entry@3 {
+			reg = <3>;
+			qcom,supply-name = "ibb";
+			qcom,supply-min-voltage = <4600000>;
+			qcom,supply-max-voltage = <6000000>;
+			qcom,supply-enable-load = <100000>;
+			qcom,supply-disable-load = <100>;
+			qcom,supply-post-on-sleep = <20>;
+		};
+	};
+};
+
+#include "panel/dsi-panel-ft8613-720p-video.dtsi"
+#include "panel/dsi-panel-ft8613-720p-video-v2.dtsi"
+
+&mdss_mdp {
+	qcom,mdss-pref-prim-intf = "dsi";
+};
+
+&mdss_dsi {
+	hw-config = "single_dsi";
+};
+
+&mdss_dsi0 {
+	qcom,dsi-pref-prim-pan = <&dsi_ft8613_720p_vid_v2>;
+	pinctrl-names = "mdss_default", "mdss_sleep";
+	pinctrl-0 = <&mdss_dsi_active>;
+	pinctrl-1 = <&mdss_dsi_suspend>;
+
+	qcom,regulator-ldo-mode;
+
+	qcom,platform-reset-gpio = <&tlmm 60 0>;
+	qcom,platform-bklight-en-gpio = <&tlmm 98 0>;
+	qcom,platform-enable-gpio = <&tlmm 99 0>;
+};
+
+&mdss_dsi1 {
+	status = "disabled";
+};
+
+&dsi_ft8613_720p_vid {
+	qcom,panel-supply-entries = <&dsi_panel_pwr_supply_pepito>;
+};
+
+&dsi_ft8613_720p_vid_v2 {
+	qcom,panel-supply-entries = <&dsi_panel_pwr_supply_pepito>;
+};
