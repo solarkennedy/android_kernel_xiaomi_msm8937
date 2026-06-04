@@ -299,7 +299,7 @@
 		num_child = <2>;
 	};
 
-	qcom,cam_smmu {
+	cam_smmu: qcom,cam_smmu {
 		status = "ok";
 		compatible = "qcom,msm-cam-smmu";
 		msm_cam_smmu_cb1: msm_cam_smmu_cb1 {
