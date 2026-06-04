@@ -1,0 +1,114 @@
+/*
+ * Audio for Palm PVG100 (pepito).
+ *
+ * vendor-legacy/qcom/msm8937.dtsi already pulls in msm8937-audio.dtsi
+ * (which defines &int_codec, &ext_codec, &wsa881x_i2c_*), and
+ * xiaomi-msm8937/common/audio.dtsi already deletes the WSA881x I2C
+ * children, the WSA-related int_codec properties, sound-9335
+ * (ext_codec), and WSA pinctrl/reset nodes.  This file just adds the
+ * pepito-specific machine-driver model, mic-bias config, MI2S / CDC-PDM
+ * pinctrl, and audio routing on top.
+ *
+ * Source: 4.9 reference msm8940-audio-pepito.dtsi.
+ */
+
+&tlmm {
+	cdc_pdm_lines: cdc-pdm-lines {
+		cdc_pdm_lines_act: pdm_lines_on {
+			mux {
+				pins = "gpio69", "gpio73", "gpio74";
+				function = "cdc_pdm0";
+			};
+			config {
+				pins = "gpio69", "gpio73", "gpio74";
+				drive-strength = <8>;
+			};
+		};
+		cdc_pdm_lines_off: pdm_lines_off {
+			mux {
+				pins = "gpio69", "gpio73", "gpio74";
+				function = "cdc_pdm0";
+			};
+			config {
+				pins = "gpio69", "gpio73", "gpio74";
+				drive-strength = <2>;
+				bias-disable;
+			};
+		};
+	};
+
+	cdc_pdm_2_lines: cdc-pdm-2-lines {
+		cdc_pdm_2_lines_act: pdm_lines_2_on {
+			mux {
+				pins = "gpio70", "gpio71", "gpio72";
+				function = "cdc_pdm0";
+			};
+			config {
+				pins = "gpio70", "gpio71", "gpio72";
+				drive-strength = <8>;
+			};
+		};
+		cdc_pdm_2_lines_off: pdm_lines_2_off {
+			mux {
+				pins = "gpio70", "gpio71", "gpio72";
+				function = "cdc_pdm0";
+			};
+			config {
+				pins = "gpio70", "gpio71", "gpio72";
+				drive-strength = <2>;
+				bias-disable;
+			};
+		};
+	};
+
+	quat_mi2s_pin: quat-mi2s-pin {
+		quat_i2s_act: quat_i2s_lines_act {
+			mux {
+				pins = "gpio94", "gpio95", "gpio12", "gpio13";
+				function = "sec_mi2s";
+			};
+			config {
+				pins = "gpio94", "gpio95", "gpio12", "gpio13";
+				drive-strength = <8>;
+				bias-disable;
+			};
+		};
+		quat_i2s_sus: quat_i2s_lines_sus {
+			mux {
+				pins = "gpio94", "gpio95", "gpio12", "gpio13";
+				function = "sec_mi2s";
+			};
+			config {
+				pins = "gpio94", "gpio95", "gpio12", "gpio13";
+				drive-strength = <2>;
+				bias-pull-down;
+			};
+		};
+	};
+};
+
+&int_codec {
+	qcom,model = "msm8952-snd-card-mtp";
+	qcom,msm-ext-pa = "primary";
+	qcom,msm-hs-micbias-type = "external";
+	qcom,msm-micbias1-ext-cap;
+
+	qcom,audio-routing =
+		"RX_BIAS", "MCLK",
+		"SPK_RX_BIAS", "MCLK",
+		"INT_LDO_H", "MCLK",
+		"MIC BIAS External", "Handset Mic",
+		"MIC BIAS External", "Secondary Mic",
+		"AMIC1", "MIC BIAS External",
+		"AMIC3", "MIC BIAS External";
+
+	qcom,msm-gpios = "pri_i2s", "quat_i2s";
+	qcom,pinctrl-names = "all_off", "pri_i2s_act",
+			     "quat_act", "quat_pri_i2s_act";
+	pinctrl-names = "all_off", "pri_i2s_act",
+			"quat_act", "quat_pri_i2s_act";
+	pinctrl-0 = <&cdc_pdm_lines_off &cdc_pdm_2_lines_off &quat_i2s_sus>;
+	pinctrl-1 = <&cdc_pdm_lines_act &cdc_pdm_2_lines_act &quat_i2s_sus>;
+	pinctrl-2 = <&cdc_pdm_lines_off &cdc_pdm_2_lines_off &quat_i2s_act>;
+	pinctrl-3 = <&cdc_pdm_lines_act &cdc_pdm_2_lines_act &quat_i2s_act>;
+};
