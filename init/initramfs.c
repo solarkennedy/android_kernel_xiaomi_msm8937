@@ -11,6 +11,8 @@
 #include <linux/utime.h>
 #include <linux/file.h>
 #include <linux/initramfs.h>
+#include <linux/io.h>
+#include <linux/vmalloc.h>
 
 static ssize_t __init xwrite(struct file *file, const char *p, size_t count,
 		loff_t *pos)
@@ -422,6 +424,107 @@ static __initdata int (*actions[])(void) = {
 	[Reset]		= do_reset,
 };
 
+/*
+ * TEMP bring-up: dump the previous boot's console-ramoops to the current
+ * console. Pepito's stock TZ silently resets the device on certain
+ * memory operations (likely PS_HOLD asserted by TZ); the kernel never
+ * gets a chance to print the panic or what it was doing at the moment
+ * of reset. But ramoops preserves the console buffer across warm
+ * resets — so on the next boot, we can read it and find out.
+ *
+ * ramoops region: 0xb0000000, 8 MiB
+ *   dmesg records:  0xb0000000 - 0xb0400000 (4 MiB, 2 records of 2 MiB)
+ *   console buffer: 0xb0400000 - 0xb0600000 (2 MiB)   <- we read this
+ *   pmsg buffer:    0xb0600000 - 0xb0800000 (2 MiB)
+ *
+ * Runs as core_initcall so it executes BEFORE the ramoops driver
+ * probes (~2.18s) and overwrites the buffer with the current boot.
+ */
+#define PEPITO_RAMOOPS_CONSOLE_ADDR  0xb0400000UL
+#define PEPITO_RAMOOPS_CONSOLE_SIZE  0x200000UL
+#define PERSISTENT_RAM_SIG_PEPITO    0x43474244UL  /* 'DBGC' */
+
+static int __init pepito_dump_prev_ramoops_console(void)
+{
+	void *base;
+	u32 sig, start, size, capacity;
+	u32 hdr_sz = 12; /* sig + start + size, all u32 */
+	char *tmp;
+	u32 i;
+
+	/* ramoops region is reserved DRAM. Use memremap with WB (write-back,
+	 * cacheable) — the kernel only allows WB for System RAM regions,
+	 * other attributes (WC/WT) get rejected. The data is just bytes;
+	 * cache attribute doesn't matter for reads after a reset (the
+	 * previous writes have long since drained to DRAM). */
+	base = memremap(PEPITO_RAMOOPS_CONSOLE_ADDR,
+			PEPITO_RAMOOPS_CONSOLE_SIZE, MEMREMAP_WB);
+	if (!base) {
+		pr_err("prev-ramoops: memremap(0x%lx, %lu) failed\n",
+		       PEPITO_RAMOOPS_CONSOLE_ADDR,
+		       PEPITO_RAMOOPS_CONSOLE_SIZE);
+		return 0;
+	}
+
+	sig   = *(u32 *)(base + 0);
+	start = *(u32 *)(base + 4);
+	size  = *(u32 *)(base + 8);
+	capacity = PEPITO_RAMOOPS_CONSOLE_SIZE - hdr_sz;
+
+	pr_info("prev-ramoops: sig=0x%08x start=%u size=%u capacity=%u\n",
+		sig, start, size, capacity);
+
+	if (sig != PERSISTENT_RAM_SIG_PEPITO) {
+		pr_info("prev-ramoops: signature mismatch — no previous boot data\n");
+		memunmap(base);
+		return 0;
+	}
+	if (size == 0 || size > capacity) {
+		pr_info("prev-ramoops: empty or invalid size, skipping\n");
+		memunmap(base);
+		return 0;
+	}
+
+	tmp = vmalloc(size + 1);
+	if (!tmp) {
+		pr_err("prev-ramoops: vmalloc(%u) failed\n", size + 1);
+		memunmap(base);
+		return 0;
+	}
+
+	if (size == capacity) {
+		/* Wrapped: data starts at `start` and runs `capacity` bytes. */
+		u32 first = capacity - start;
+		memcpy(tmp, base + hdr_sz + start, first);
+		memcpy(tmp + first, base + hdr_sz, start);
+	} else {
+		memcpy(tmp, base + hdr_sz, size);
+	}
+	tmp[size] = '\0';
+
+	pr_info("prev-ramoops: ====== BEGIN previous boot console ======\n");
+	/* Print line-by-line so the timestamps don't get mangled. */
+	{
+		char *p = tmp;
+		char *end = tmp + size;
+		while (p < end) {
+			char *nl = memchr(p, '\n', end - p);
+			if (!nl) {
+				printk(KERN_INFO "prev: %.*s\n", (int)(end - p), p);
+				break;
+			}
+			printk(KERN_INFO "prev: %.*s\n", (int)(nl - p), p);
+			p = nl + 1;
+		}
+	}
+	pr_info("prev-ramoops: ====== END previous boot console ======\n");
+
+	vfree(tmp);
+	memunmap(base);
+	return 0;
+}
+core_initcall(pepito_dump_prev_ramoops_console);
+
 static long __init write_buffer(char *buf, unsigned long len)
 {
 	byte_count = len;
@@ -670,6 +773,20 @@ static int __init populate_rootfs(void)
 	/* If available load the bootloader supplied initrd */
 	if (initrd_start && !IS_ENABLED(CONFIG_INITRAMFS_FORCE)) {
 #ifdef CONFIG_BLK_DEV_RAM
+		printk(KERN_INFO "initrd_start=0x%lx initrd_end=0x%lx size=%lu\n",
+			initrd_start, initrd_end, initrd_end - initrd_start);
+		{
+			unsigned char *p = (unsigned char *)initrd_start;
+			unsigned long sz = initrd_end - initrd_start;
+			volatile unsigned long checksum = 0;
+			unsigned long i;
+			printk(KERN_INFO "initrd first bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+			printk(KERN_INFO "initrd: scanning all %lu bytes...\n", sz);
+			for (i = 0; i < sz; i++)
+				checksum += p[i];
+			printk(KERN_INFO "initrd: scan done, checksum=0x%lx\n", checksum);
+		}
 		printk(KERN_INFO "Trying to unpack rootfs image as initramfs...\n");
 		err = unpack_to_rootfs((char *)initrd_start,
 			initrd_end - initrd_start);
