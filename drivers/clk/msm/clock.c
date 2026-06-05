@@ -1386,6 +1386,16 @@ static int __init clock_late_init(void)
 	}
 
 	list_for_each_entry_safe(h, h_temp, &handoff_list, list) {
+		/*
+		 * TEMP bring-up instrumentation: log the dbg_name of every
+		 * clock whose bootloader handoff vote is about to be dropped.
+		 * On pepito stock TZ this loop is interrupted by a PS_HOLD
+		 * reset partway through; ramoops captures the last line, so
+		 * pepito_dump_prev_ramoops_console on the next boot tells us
+		 * exactly which clock(s) to add to a denylist.
+		 */
+		pr_info("clock_late_init: dropping handoff %s\n",
+			h->clk->dbg_name ? h->clk->dbg_name : "<unnamed>");
 		clk_disable_unprepare(h->clk);
 		list_del(&h->list);
 		kfree(h);
