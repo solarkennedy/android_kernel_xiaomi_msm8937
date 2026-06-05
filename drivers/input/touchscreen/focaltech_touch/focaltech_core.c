@@ -1693,6 +1693,7 @@ static int fts_ts_resume(struct device *dev)
 *****************************************************************************/
 static int fts_ts_check_dt(struct device_node *np)
 {
+#if defined(CONFIG_DRM)
 	int i;
 	int count;
 	struct device_node *node;
@@ -1713,6 +1714,9 @@ static int fts_ts_check_dt(struct device_node *np)
 	}
 
 	return -ENODEV;
+#else
+	return 0;
+#endif
 }
 
 static int fts_ts_check_default_tp(struct device_node *dt, const char *prop)
