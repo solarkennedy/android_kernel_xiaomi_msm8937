@@ -1403,33 +1403,5 @@ static int __init clock_late_init(void)
 }
 /* clock_late_init should run only after all deferred probing
  * (excluding DLKM probes) has completed.
- *
- * TEMP bring-up workaround for pepito (PLAN.md §3.1m):
- *
- * clock_late_init walks every clock the bootloader left with
- * CLKFLAG_HANDOFF still set and drops that handoff vote.  Clocks any
- * kernel driver actually claimed via clk_get / clk_prepare_enable are
- * unaffected; clocks the bootloader left enabled but no driver took
- * ownership of get disabled here.
- *
- * On pepito's stock TZ this triggers a deterministic PS_HOLD reset
- * around t=5.5s: one of the disabled handoff clocks belongs to a
- * piece of hardware that's still actively in use (the working theory
- * is a SMMU TBU clock — mdss_smmu, cam_smmu, vidc_smmu master probes
- * succeed but none of them claim their TBU clocks; bootloader-handed
- * off TBU clocks then get dropped here, and the next DMA transaction
- * through that SMMU's TBU faults; TZ asserts PS_HOLD).  This is the
- * same root-cause family as §3.1b (older Palm 8.1 TZ blob, stricter
- * about what kernel touches what hardware), not a kernel-internal bug.
- *
- * Other Mi8937 variants that boot fine in this tree run against post-
- * update Xiaomi TZ blobs that tolerate this disable.  Pepito doesn't.
- *
- * Skipping the registration is the simplest "make it boot" fix.  We
- * leak the handoff votes on whatever the bootloader left enabled —
- * a few mW of standby cost that doesn't break anything functional
- * during bring-up.  Revisit with a clock-name denylist (so only
- * TZ-critical TBU clocks are spared and the rest get cleaned up) once
- * we're solidly into userspace.
  */
-/* late_initcall_sync(clock_late_init); */
+late_initcall_sync(clock_late_init);
