@@ -1387,15 +1387,21 @@ static int __init clock_late_init(void)
 
 	list_for_each_entry_safe(h, h_temp, &handoff_list, list) {
 		/*
-		 * TEMP bring-up instrumentation: log the dbg_name of every
-		 * clock whose bootloader handoff vote is about to be dropped.
-		 * On pepito stock TZ this loop is interrupted by a PS_HOLD
-		 * reset partway through; ramoops captures the last line, so
-		 * pepito_dump_prev_ramoops_console on the next boot tells us
-		 * exactly which clock(s) to add to a denylist.
+		 * Pepito (MSM8940 + stock Palm TZ 8.1): dropping the USB HS
+		 * system clock handoff vote trips a TZ xPU assertion that fires
+		 * PS_HOLD before the kernel can print a panic.  Every other
+		 * handoff clock in the list drops cleanly (confirmed via ramoops
+		 * — all clocks through sdcc1_apps_clk_src complete; the log cuts
+		 * off mid-line at "usb_hs_sy").  Keep the bootloader's vote on
+		 * this clock; it stays enabled at its boot rate and USB HS will
+		 * re-vote when the gadget driver probes.
 		 */
-		pr_info("clock_late_init: dropping handoff %s\n",
-			h->clk->dbg_name ? h->clk->dbg_name : "<unnamed>");
+		if (h->clk->dbg_name &&
+		    !strcmp(h->clk->dbg_name, "usb_hs_system_clk_src")) {
+			list_del(&h->list);
+			kfree(h);
+			continue;
+		}
 		clk_disable_unprepare(h->clk);
 		list_del(&h->list);
 		kfree(h);
