@@ -84,8 +84,8 @@ struct bhy_data_bus {
 };
 
 struct __attribute__((__packed__)) fifo_frame {
-	u16 handle;
-	u8 data[20];
+	u8 handle;
+	u8 data[21];
 };
 
 #define BHY_FRAME_SIZE		7000
