@@ -5028,7 +5028,7 @@ static ssize_t bhy_store_req_fw(struct device *dev
 	u16 u16_val;
 	u32 u32_val;
 	int retry = BHY_RESET_WAIT_RETRY;
-	int reset_flag_copy;
+	/* int reset_flag_copy; */
 	struct ram_patch_header header;
 	ssize_t read_len;
 	char data_buf[64]; /* Must be less than burst write max buf */
@@ -5064,6 +5064,11 @@ static ssize_t bhy_store_req_fw(struct device *dev
 		atomic_set(&client_data->reset_flag, RESET_FLAG_ERROR);
 		return ret;
 	}
+	/* Ignore checking — same as bhy_load_ram_patch. The BHI160B does not
+	 * reliably assert INT after a bare reset (only after firmware runs), so
+	 * waiting for the IRQ-driven READY flip here fails whenever the INT
+	 * line was not already high. The CHIP_STATUS FIRMWARE_IDLE poll below
+	 * is the authoritative upload-ready gate.
 	while (retry--) {
 		reset_flag_copy = atomic_read(&client_data->reset_flag);
 		if (reset_flag_copy == RESET_FLAG_READY)
@@ -5076,7 +5081,8 @@ static ssize_t bhy_store_req_fw(struct device *dev
 		atomic_set(&client_data->reset_flag, RESET_FLAG_ERROR);
 		return -EIO;
 	}
-	PINFO("BHy reset successfully");
+	*/
+	PINFO("BHy reset requested, polling chip status");
 
 	/* Check chip status */
 	retry = 1000;
