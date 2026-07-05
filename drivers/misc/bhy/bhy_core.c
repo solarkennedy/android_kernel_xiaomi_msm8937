@@ -1775,15 +1775,15 @@ void detect_init_event(struct bhy_client_data *client_data)
 	if (client_data->enable_irq_log)
 		PDEBUG("Fifo length: %d", bytes_remain);
 #endif /*~ BHY_DEBUG */
-	PINFO("detect_init_event: bytes_remain=%u", bytes_remain);
 	if (bytes_remain == 0) {
 		mutex_unlock(&client_data->mutex_bus_op);
-		PINFO("detect_init_event: zero-length FIFO — META_EVENT missed");
+		int_debug(client_data, "Zero length FIFO detected",
+			__func__, __LINE__);
 		return;
 	}
 	if (bytes_remain > BHY_FIFO_LEN_MAX) {
 		mutex_unlock(&client_data->mutex_bus_op);
-		PINFO("detect_init_event: oversized FIFO (%u)", bytes_remain);
+		PDEBUG("Start up sequence error: Over sized FIFO");
 		return;
 	}
 	ret = bhy_read_reg(client_data, BHY_REG_FIFO_BUFFER_0,
@@ -1793,8 +1793,6 @@ void detect_init_event(struct bhy_client_data *client_data)
 		PERR("Read fifo data failed");
 		return;
 	}
-	PINFO("detect_init_event: FIFO[0..3]=%02X %02X %02X %02X",
-		data[0], data[1], data[2], data[3]);
 	mutex_unlock(&client_data->mutex_bus_op);
 
 	mutex_lock(&q->lock);
@@ -1802,13 +1800,11 @@ void detect_init_event(struct bhy_client_data *client_data)
 			parse_index += data_len + 1) {
 		sensor_type = data[parse_index];
 		data_len = client_data->sensor_data_len[sensor_type];
-		PINFO("detect_init_event: parse_index=%d sensor_type=0x%02X data_len=%d",
-			parse_index, sensor_type, data_len);
 		if (data_len < 0)
 			break;
 		if (parse_index + data_len >= bytes_remain) {
-			PERR("Invalid FIFO data detected for sensor_type %d (parse_index=%d data_len=%d bytes_remain=%u)",
-				sensor_type, parse_index, data_len, bytes_remain);
+			PERR("Invalid FIFO data detected for sensor_type %d",
+				sensor_type);
 			break;
 		}
 		/* Palm's BHI160B firmware emits the boot meta events on the
@@ -1816,7 +1812,6 @@ void detect_init_event(struct bhy_client_data *client_data)
 		if ((sensor_type == BHY_SENSOR_HANDLE_META_EVENT ||
 			sensor_type == BHY_SENSOR_HANDLE_META_EVENT_WU) &&
 			data[parse_index + 1] == META_EVENT_INITIALIZED) {
-			PINFO("detect_init_event: META_EVENT_INITIALIZED found → INITIALIZED");
 			atomic_set(&client_data->reset_flag,
 					RESET_FLAG_INITIALIZED);
 #ifdef BHY_DEBUG
