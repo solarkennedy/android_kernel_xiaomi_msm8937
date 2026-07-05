@@ -1811,7 +1811,10 @@ void detect_init_event(struct bhy_client_data *client_data)
 				sensor_type, parse_index, data_len, bytes_remain);
 			break;
 		}
-		if (sensor_type == BHY_SENSOR_HANDLE_META_EVENT &&
+		/* Palm's BHI160B firmware emits the boot meta events on the
+		 * wake-up FIFO (0xF8), not the non-wake channel (0xFE). */
+		if ((sensor_type == BHY_SENSOR_HANDLE_META_EVENT ||
+			sensor_type == BHY_SENSOR_HANDLE_META_EVENT_WU) &&
 			data[parse_index + 1] == META_EVENT_INITIALIZED) {
 			PINFO("detect_init_event: META_EVENT_INITIALIZED found → INITIALIZED");
 			atomic_set(&client_data->reset_flag,
@@ -1902,7 +1905,8 @@ void detect_self_test_event(struct bhy_client_data *client_data)
 				sensor_type);
 			break;
 		}
-		if (sensor_type == BHY_SENSOR_HANDLE_META_EVENT &&
+		if ((sensor_type == BHY_SENSOR_HANDLE_META_EVENT ||
+			sensor_type == BHY_SENSOR_HANDLE_META_EVENT_WU) &&
 			data[parse_index + 1] == META_EVENT_SELF_TEST_RESULTS) {
 			idx = -1;
 			switch (data[parse_index + 2]) {
