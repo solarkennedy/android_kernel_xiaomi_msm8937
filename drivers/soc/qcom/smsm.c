@@ -12,7 +12,6 @@
  * GNU General Public License for more details.
  */
 
-#include <linux/debugfs.h>
 #include <linux/interrupt.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
@@ -57,23 +56,6 @@
 #define SMEM_SMSM_SHARED_STATE		85
 #define SMEM_SMSM_CPU_INTR_MASK		333
 #define SMEM_SMSM_SIZE_INFO		419
-
-/*
- * Legacy SMSM boot handshake, as implemented by downstream msm-3.18
- * drivers/soc/qcom/smd.c (smsm_init / smsm_irq_handler): the 2018-era
- * modem raises SMSM_INIT (+SMSM_SMDINIT) in its own state entry and the
- * apps processor is expected to mirror those bits into the apps entry and
- * kick the modem back. Legacy modem firmware gates parts of its bring-up
- * on the apps entry (on pepito: RFSA shared-buffer discovery for
- * EFS-over-RMTS). Bit values from stock include/soc/qcom/smsm.h.
- */
-#define SMSM_LEGACY_INIT	BIT(0)	/* stock SMSM_INIT */
-#define SMSM_LEGACY_SMDINIT	BIT(3)	/* stock SMSM_SMDINIT */
-#define SMSM_LEGACY_RESET	BIT(6)	/* stock SMSM_RESET */
-#define SMSM_LEGACY_PROC_AWAKE	BIT(12)	/* stock SMSM_PROC_AWAKE */
-#define SMSM_LEGACY_MODEM_MASK	(SMSM_LEGACY_INIT | SMSM_LEGACY_SMDINIT | \
-				 SMSM_LEGACY_RESET)
-#define SMSM_MODEM_ENTRY	1	/* stock SMSM_MODEM_STATE */
 
 /*
  * Default sizes, in case SMEM_SMSM_SIZE_INFO is not found.
@@ -225,7 +207,6 @@ static const struct qcom_smem_state_ops smsm_state_ops = {
 static irqreturn_t smsm_intr(int irq, void *data)
 {
 	struct smsm_entry *entry = data;
-	struct qcom_smsm *smsm = entry->smsm;
 	unsigned i;
 	int irq_pin;
 	u32 changed;
@@ -233,25 +214,6 @@ static irqreturn_t smsm_intr(int irq, void *data)
 
 	val = readl(entry->remote_state);
 	changed = val ^ xchg(&entry->last_value, val);
-
-	/* Legacy handshake: mirror the modem's INIT/SMDINIT into the apps
-	 * entry and kick it back, like stock smsm_irq_handler. */
-	if (entry == &smsm->entries[SMSM_MODEM_ENTRY] && changed) {
-		u32 mirror = 0;
-
-		if (val & SMSM_LEGACY_RESET)
-			pr_err("smsm: modem raised SMSM_RESET (state %08x)\n",
-			       val);
-		else if (val & SMSM_LEGACY_INIT)
-			mirror = SMSM_LEGACY_INIT |
-				 (val & SMSM_LEGACY_SMDINIT);
-
-		if (mirror)
-			smsm_update_bits(smsm, 0, mirror);
-
-		pr_info("smsm: modem state %08x -> apps state %08x\n",
-			val, readl(smsm->local_state));
-	}
 
 	for_each_set_bit(i, entry->irq_enabled, 32) {
 		if (!(changed & BIT(i)))
@@ -475,62 +437,6 @@ static int smsm_inbound_entry(struct qcom_smsm *smsm,
  *
  * Returns 0 on success, negative errno on failure.
  */
-/*
- * Debug/experiment interface: /sys/kernel/debug/smsm_legacy
- * Read: dumps every host's state word plus the full interrupt-mask matrix.
- * Write: "<hex>" sets the apps state word to exactly that value (and kicks
- * subscribed hosts), so handshake variants can be tested against an
- * on-demand modem SSR without reflashing.
- */
-static int smsm_legacy_show(struct seq_file *s, void *unused)
-{
-	struct qcom_smsm *smsm = s->private;
-	u32 *states = smsm->local_state - smsm->local_host;
-	u32 *intr_mask = smsm->subscription - smsm->local_host * smsm->num_hosts;
-	unsigned i, j;
-
-	for (i = 0; i < smsm->num_entries; i++)
-		seq_printf(s, "state[%u] = %08x\n", i, readl(states + i));
-	for (i = 0; i < smsm->num_entries; i++) {
-		seq_printf(s, "intr_mask[entry %u] =", i);
-		for (j = 0; j < smsm->num_hosts; j++)
-			seq_printf(s, " %08x",
-				   readl(intr_mask + i * smsm->num_hosts + j));
-		seq_puts(s, "\n");
-	}
-	return 0;
-}
-
-static int smsm_legacy_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, smsm_legacy_show, inode->i_private);
-}
-
-static ssize_t smsm_legacy_write(struct file *file, const char __user *buf,
-				 size_t count, loff_t *ppos)
-{
-	struct qcom_smsm *smsm = ((struct seq_file *)file->private_data)->private;
-	u32 val;
-	int ret;
-
-	ret = kstrtou32_from_user(buf, count, 16, &val);
-	if (ret)
-		return ret;
-
-	smsm_update_bits(smsm, ~0U, val);
-	pr_info("smsm: apps state manually set to %08x\n",
-		readl(smsm->local_state));
-	return count;
-}
-
-static const struct file_operations smsm_legacy_fops = {
-	.open = smsm_legacy_open,
-	.read = seq_read,
-	.write = smsm_legacy_write,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
 static int smsm_get_size_info(struct qcom_smsm *smsm)
 {
 	size_t size;
@@ -686,25 +592,6 @@ static int qcom_smsm_probe(struct platform_device *pdev)
 		if (ret < 0)
 			goto unwind_interfaces;
 	}
-
-	/*
-	 * Legacy handshake: subscribe apps to the modem's
-	 * RESET/INIT/SMDINIT edges so the modem kicks our SMSM interrupt
-	 * when it initializes (stock smsm_init writes the same mask), and
-	 * advertise apps as awake, which stock sets at boot via its PM
-	 * notifier before the modem is brought out of reset.
-	 */
-	entry = &smsm->entries[SMSM_MODEM_ENTRY];
-	if (smsm->num_entries > SMSM_MODEM_ENTRY && entry->subscription) {
-		writel(SMSM_LEGACY_MODEM_MASK,
-		       entry->subscription + smsm->local_host);
-		pr_info("smsm: legacy modem handshake armed (mask %08x)\n",
-			SMSM_LEGACY_MODEM_MASK);
-	}
-	smsm_update_bits(smsm, 0, SMSM_LEGACY_PROC_AWAKE);
-
-	debugfs_create_file("smsm_legacy", 0600, NULL, smsm,
-			    &smsm_legacy_fops);
 
 	platform_set_drvdata(pdev, smsm);
 	of_node_put(local_node);
