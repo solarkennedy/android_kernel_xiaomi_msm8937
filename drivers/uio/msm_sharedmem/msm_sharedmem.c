@@ -15,6 +15,8 @@
 
 #include <soc/qcom/secure_buffer.h>
 
+#include "sharedmem_qmi.h"
+
 #define CLIENT_ID_PROP "qcom,client-id"
 #define MPSS_RMTS_CLIENT_ID 1
 
@@ -110,6 +112,7 @@ static int msm_sharedmem_probe(struct platform_device *pdev)
 	int ret = 0;
 	struct uio_info *info = NULL;
 	struct resource *clnt_res = NULL;
+	struct sharemem_qmi_entry qmi_entry;
 	u32 client_id = ((u32)~0U);
 	u32 shared_mem_size = 0;
 	u32 shared_mem_tot_sz = 0;
@@ -203,6 +206,13 @@ static int msm_sharedmem_probe(struct platform_device *pdev)
 	}
 	dev_set_drvdata(&pdev->dev, info);
 
+	qmi_entry.client_id = client_id;
+	qmi_entry.client_name = info->name;
+	qmi_entry.address = info->mem[0].addr;
+	qmi_entry.size = info->mem[0].size;
+	qmi_entry.is_addr_dynamic = is_addr_dynamic;
+
+	sharedmem_qmi_add_entry(&qmi_entry);
 	pr_info("Device created for client '%s'\n", clnt_res->name);
 out:
 	return ret;
@@ -237,6 +247,12 @@ static int __init msm_sharedmem_init(void)
 {
 	int result;
 
+	result = sharedmem_qmi_init();
+	if (result < 0) {
+		pr_err("sharedmem_qmi_init failed result = %d\n", result);
+		return result;
+	}
+
 	result = platform_driver_register(&msm_sharedmem_driver);
 	if (result != 0) {
 		pr_err("Platform driver registration failed\n");
@@ -248,6 +264,7 @@ static int __init msm_sharedmem_init(void)
 static void __exit msm_sharedmem_exit(void)
 {
 	platform_driver_unregister(&msm_sharedmem_driver);
+	sharedmem_qmi_exit();
 }
 
 module_init(msm_sharedmem_init);

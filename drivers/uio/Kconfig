@@ -167,6 +167,8 @@ config UIO_HV_GENERIC
 
 config UIO_MSM_SHAREDMEM
 	bool "MSM shared memory driver"
+	depends on QRTR
+	select QCOM_QMI_HELPERS
 	default n
 	help
 	  Provides the clients with their respective alloted shared memory
