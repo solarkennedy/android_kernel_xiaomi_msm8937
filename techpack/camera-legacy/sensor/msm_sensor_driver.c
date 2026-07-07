@@ -98,7 +98,8 @@ static int32_t msm_sensor_driver_create_i2c_v4l_subdev
 
 	CDBG("%s %s I2c probe succeeded\n", __func__, client->name);
 	if (0 == s_ctrl->bypass_video_node_creation) {
-		rc = legacy_camera_init_v4l2(&client->dev, &session_id);
+		rc = legacy_camera_init_v4l2(&client->dev, s_ctrl->id,
+			&session_id);
 		if (rc < 0) {
 			pr_err("failed: camera_init_i2c_v4l2 rc %d", rc);
 			return rc;
@@ -141,7 +142,8 @@ static int32_t msm_sensor_driver_create_v4l_subdev
 	uint32_t session_id = 0;
 
 	if (0 == s_ctrl->bypass_video_node_creation) {
-		rc = legacy_camera_init_v4l2(&s_ctrl->pdev->dev, &session_id);
+		rc = legacy_camera_init_v4l2(&s_ctrl->pdev->dev, s_ctrl->id,
+			&session_id);
 		if (rc < 0) {
 			pr_err("failed: legacy_camera_init_v4l2 rc %d", rc);
 			return rc;

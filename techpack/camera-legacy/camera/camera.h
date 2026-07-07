@@ -18,6 +18,7 @@ enum stream_state {
 	STOP_STREAM,
 };
 
-int legacy_camera_init_v4l2(struct device *dev, unsigned int *session);
+int legacy_camera_init_v4l2(struct device *dev, unsigned int camera_id,
+	unsigned int *session);
 
 #endif /*_CAMERA_H */

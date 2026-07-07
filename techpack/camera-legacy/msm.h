@@ -44,6 +44,7 @@ extern bool legacy_is_daemon_status;
 
 struct msm_video_device {
 	struct video_device *vdev;
+	unsigned int session_id;
 	atomic_t opened;
 	struct mutex video_drvdata_mutex;
 };
