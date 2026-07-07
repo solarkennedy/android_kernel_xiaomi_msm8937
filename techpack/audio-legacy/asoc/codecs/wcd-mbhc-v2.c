@@ -1658,6 +1658,14 @@ int wcd_mbhc_start(struct wcd_mbhc *mbhc, struct wcd_mbhc_config *mbhc_cfg)
 	if (!mbhc || !mbhc_cfg)
 		return -EINVAL;
 
+	/*
+	 * MBHC disabled via DT (jack-less board, e.g. pepito): wcd_mbhc_init()
+	 * bailed before setting mbhc->component when qcom,msm-mbhc-*-swh are
+	 * absent.  Skip start without failing card init (matches stock 3.18).
+	 */
+	if (!mbhc->component)
+		return 0;
+
 	component = mbhc->component;
 	card = component->card;
 
