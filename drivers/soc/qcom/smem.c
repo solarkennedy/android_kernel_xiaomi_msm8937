@@ -83,6 +83,10 @@
 /* Processor/host identifier for the application processor */
 #define SMEM_HOST_APPS		0
 
+/* radio13-lane1: modem SMEM host id (DT smp2p-modem qcom,remote-pid=1;
+ * stock msm-3.18 smem.h enum SMEM_APPS=0, SMEM_MODEM=1) */
+#define SMEM_HOST_MODEM_LANE1	1
+
 /* Processor/host identifier for the global partition */
 #define SMEM_GLOBAL_HOST	0xfffe
 
@@ -1200,6 +1204,88 @@ static ssize_t smem_raw_read(struct file *file, char __user *buf,
 	return n;
 }
 
+/*
+ * radio13-lane1: the global smem_raw above covers ONLY regions[0], whose size
+ * qcom_smem_map_legacy() clamps to (available + free_offset) = the used global
+ * heap. It cannot reach the $TOC partition table (last 4K of the DT region) or
+ * the private apps<->remote partitions. This adds:
+ *   /d/smem_parts — the ptable ($TOC) entries + each populated per-host
+ *                   partition descriptor/header (host0/host1, size, free ptrs);
+ *   /d/smem_part_raw — raw dump of partition_desc[SMEM_HOST_MODEM] (the
+ *                   apps<->modem private partition), for a byte-level content
+ *                   diff stock-vs-ours if a future lane needs partition CONTENT.
+ * Read-only. SMEM_HOST_MODEM index below is the QRTR/SMEM host id for the modem.
+ */
+static int smem_parts_show(struct seq_file *s, void *unused)
+{
+	struct qcom_smem *smem = s->private;
+	struct smem_partition_header *hdr;
+	unsigned int h;
+
+	if (smem->global_partition_desc.virt_base) {
+		hdr = smem->global_partition_desc.virt_base;
+		seq_printf(s, "global: phys=%08x size=%08x free_unc=%08x free_c=%08x host0=%u host1=%u\n",
+			   smem->global_partition_desc.phys_base,
+			   le32_to_cpu(hdr->size),
+			   le32_to_cpu(hdr->offset_free_uncached),
+			   le32_to_cpu(hdr->offset_free_cached),
+			   le16_to_cpu(hdr->host0), le16_to_cpu(hdr->host1));
+	} else {
+		seq_puts(s, "global: none (SBL legacy heap)\n");
+	}
+
+	for (h = 0; h < SMEM_HOST_COUNT; h++) {
+		struct smem_partition_desc *pd = &smem->partition_desc[h];
+
+		if (!pd->virt_base)
+			continue;
+		hdr = pd->virt_base;
+		seq_printf(s, "host[%u]: phys=%08x size=%08x free_unc=%08x free_c=%08x host0=%u host1=%u cacheline=%u\n",
+			   h, pd->phys_base, le32_to_cpu(hdr->size),
+			   le32_to_cpu(hdr->offset_free_uncached),
+			   le32_to_cpu(hdr->offset_free_cached),
+			   le16_to_cpu(hdr->host0), le16_to_cpu(hdr->host1),
+			   pd->cacheline);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(smem_parts);
+
+static ssize_t smem_part_raw_read(struct file *file, char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	struct qcom_smem *smem = file->private_data;
+	struct smem_partition_desc *pd = &smem->partition_desc[SMEM_HOST_MODEM_LANE1];
+	size_t avail;
+	ssize_t n;
+	void *tmp;
+
+	if (!pd->virt_base)
+		return 0;
+	if (*ppos < 0 || *ppos >= pd->size)
+		return 0;
+	avail = pd->size - *ppos;
+	n = min_t(size_t, min_t(size_t, count, avail), SZ_4K);
+
+	tmp = kmalloc(n, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+	memcpy_fromio(tmp, (const char __iomem *)pd->virt_base + *ppos, n);
+	if (copy_to_user(buf, tmp, n)) {
+		kfree(tmp);
+		return -EFAULT;
+	}
+	kfree(tmp);
+	*ppos += n;
+	return n;
+}
+
+static const struct file_operations smem_part_raw_fops = {
+	.open = simple_open,
+	.read = smem_part_raw_read,
+	.llseek = default_llseek,
+};
+
 static const struct file_operations smem_raw_fops = {
 	.open = simple_open,
 	.read = smem_raw_read,
@@ -1279,6 +1365,8 @@ static int qcom_smem_probe(struct platform_device *pdev)
 
 	debugfs_create_file("smem_toc", 0400, NULL, smem, &smem_toc_fops);
 	debugfs_create_file("smem_raw", 0400, NULL, smem, &smem_raw_fops);
+	debugfs_create_file("smem_parts", 0400, NULL, smem, &smem_parts_fops);
+	debugfs_create_file("smem_part_raw", 0400, NULL, smem, &smem_part_raw_fops);
 
 	return 0;
 }
