@@ -915,6 +915,14 @@ static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 		break;
 	}
 
+	/* [PEPITO] TCL/Palm-custom OTP cfgtype: no-op for ov12a10 (mirrors
+	 * stock 3.18 msm_sensor.c). The 32-bit Palm camera blob sends this
+	 * during OTP init; without the case it falls to default -> -EFAULT
+	 * -> "otp init error -1" -> null lib handle -> provider SIGSEGV.
+	 */
+	case CFG_SENSOR_OTP_UPDATE:
+		break;
+
 	default:
 		rc = -EFAULT;
 		break;
@@ -1396,6 +1404,10 @@ int legacy_msm_sensor_config(struct msm_sensor_ctrl_t *s_ctrl, void __user *argp
 		}
 		break;
 	}
+
+	/* [PEPITO] TCL/Palm-custom OTP cfgtype: no-op (mirrors stock 3.18). */
+	case CFG_SENSOR_OTP_UPDATE:
+		break;
 
 	default:
 		rc = -EFAULT;

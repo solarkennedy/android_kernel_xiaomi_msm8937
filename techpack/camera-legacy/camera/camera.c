@@ -57,7 +57,7 @@ static void camera_pack_event(struct file *filep, int evt_id,
 	event->type = MSM_CAMERA_V4L2_EVENT_TYPE;
 	event->id = evt_id;
 	event_data->command = command;
-	event_data->session_id = pvdev->vdev->num;
+	event_data->session_id = pvdev->session_id;
 	event_data->stream_id = sp->stream_id;
 	event_data->arg_value = value;
 }
@@ -190,7 +190,7 @@ static int camera_v4l2_g_ctrl(struct file *filep, void *fh,
 	int rc = 0;
 	struct v4l2_event event;
 	struct msm_video_device *pvdev = video_drvdata(filep);
-	unsigned int session_id = pvdev->vdev->num;
+	unsigned int session_id = pvdev->session_id;
 
 	if (ctrl->id >= V4L2_CID_PRIVATE_BASE) {
 		if (ctrl->id == MSM_CAMERA_PRIV_G_SESSION_ID) {
@@ -238,7 +238,7 @@ static int camera_v4l2_reqbufs(struct file *filep, void *fh,
 	struct msm_session *session;
 	struct camera_v4l2_private *sp = fh_to_private(fh);
 	struct msm_video_device *pvdev = video_drvdata(filep);
-	unsigned int session_id = pvdev->vdev->num;
+	unsigned int session_id = pvdev->session_id;
 	session = legacy_msm_session_find(session_id);
 	if (WARN_ON(!session))
 		return -EIO;
@@ -261,7 +261,7 @@ static int camera_v4l2_qbuf(struct file *filep, void *fh,
 	struct msm_session *session;
 	struct camera_v4l2_private *sp = fh_to_private(fh);
 		struct msm_video_device *pvdev = video_drvdata(filep);
-	unsigned int session_id = pvdev->vdev->num;
+	unsigned int session_id = pvdev->session_id;
 	session = legacy_msm_session_find(session_id);
 	if (WARN_ON(!session))
 		return -EIO;
@@ -278,7 +278,7 @@ static int camera_v4l2_dqbuf(struct file *filep, void *fh,
 	struct msm_session *session;
 	struct camera_v4l2_private *sp = fh_to_private(fh);
 		struct msm_video_device *pvdev = video_drvdata(filep);
-	unsigned int session_id = pvdev->vdev->num;
+	unsigned int session_id = pvdev->session_id;
 	session = legacy_msm_session_find(session_id);
 	if (WARN_ON(!session))
 		return -EIO;
@@ -513,7 +513,7 @@ static long camera_v4l2_vidioc_private_ioctl(struct file *filep, void *fh,
 			sizeof(struct msm_camera_return_buf))) {
 			return -EFAULT;
 		}
-		rc = legacy_msm_vb2_return_buf_by_idx(pvdev->vdev->num, sp->stream_id,
+		rc = legacy_msm_vb2_return_buf_by_idx(pvdev->session_id, sp->stream_id,
 			ptr.index);
 		}
 		break;
@@ -643,7 +643,9 @@ static int camera_v4l2_open(struct file *filep)
 	struct v4l2_event event;
 	struct msm_video_device *pvdev = video_drvdata(filep);
 	unsigned long opn_idx, idx;
+	unsigned int session_id;
 	BUG_ON(!pvdev);
+	session_id = pvdev->session_id;
 
 	mutex_lock(&pvdev->video_drvdata_mutex);
 	rc = camera_v4l2_fh_open(filep);
@@ -670,14 +672,14 @@ static int camera_v4l2_open(struct file *filep)
 		legacy_msm_pm_qos_update_request(CAMERA_DISABLE_PC_LATENCY);
 
 		/* create a new session when first opened */
-		rc = legacy_msm_create_session(pvdev->vdev->num, pvdev->vdev);
+		rc = legacy_msm_create_session(session_id, pvdev->vdev);
 		if (rc < 0) {
 			pr_err("%s : session creation failed Line %d rc %d\n",
 					__func__, __LINE__, rc);
 			goto session_fail;
 		}
 
-		rc = legacy_msm_create_command_ack_q(pvdev->vdev->num,
+		rc = legacy_msm_create_command_ack_q(session_id,
 			find_first_zero_bit((const unsigned long *)&opn_idx,
 				MSM_CAMERA_STREAM_CNT_BITS));
 		if (rc < 0) {
@@ -704,7 +706,7 @@ static int camera_v4l2_open(struct file *filep)
 		/* Enable power collapse latency */
 		legacy_msm_pm_qos_update_request(CAMERA_ENABLE_PC_LATENCY);
 	} else {
-		rc = legacy_msm_create_command_ack_q(pvdev->vdev->num,
+		rc = legacy_msm_create_command_ack_q(session_id,
 			find_first_zero_bit((const unsigned long *)&opn_idx,
 				MSM_CAMERA_STREAM_CNT_BITS));
 		if (rc < 0) {
@@ -721,9 +723,9 @@ static int camera_v4l2_open(struct file *filep)
 	return rc;
 
 post_fail:
-	legacy_msm_delete_command_ack_q(pvdev->vdev->num, 0);
+	legacy_msm_delete_command_ack_q(session_id, 0);
 command_ack_q_fail:
-	legacy_msm_destroy_session(pvdev->vdev->num);
+	legacy_msm_destroy_session(session_id);
 session_fail:
 	legacy_msm_pm_qos_update_request(CAMERA_ENABLE_PC_LATENCY);
 	pm_relax(&pvdev->vdev->dev);
@@ -757,9 +759,11 @@ static int camera_v4l2_close(struct file *filep)
 	struct msm_video_device *pvdev = video_drvdata(filep);
 	struct camera_v4l2_private *sp = fh_to_private(filep->private_data);
 	unsigned int opn_idx, mask;
+	unsigned int session_id;
 	struct msm_session *session;
 	BUG_ON(!pvdev);
-	session = legacy_msm_session_find(pvdev->vdev->num);
+	session_id = pvdev->session_id;
+	session = legacy_msm_session_find(session_id);
 	if (WARN_ON(!session))
 		return -EIO;
 
@@ -786,21 +790,21 @@ static int camera_v4l2_close(struct file *filep)
 				0, -1, &event);
 			legacy_msm_post_event(&event, MSM_POST_EVT_TIMEOUT);
 		}
-		legacy_msm_delete_command_ack_q(pvdev->vdev->num, 0);
-		legacy_msm_delete_stream(pvdev->vdev->num, sp->stream_id);
+		legacy_msm_delete_command_ack_q(session_id, 0);
+		legacy_msm_delete_stream(session_id, sp->stream_id);
 		mutex_unlock(&session->close_lock);
 		/* This should take care of both normal close
 		 * and application crashes */
 		camera_v4l2_vb2_q_release(filep);
-		legacy_msm_destroy_session(pvdev->vdev->num);
+		legacy_msm_destroy_session(session_id);
 
 		pm_relax(&pvdev->vdev->dev);
 	} else {
-		legacy_msm_delete_command_ack_q(pvdev->vdev->num,
+		legacy_msm_delete_command_ack_q(session_id,
 			sp->stream_id);
 
 		camera_v4l2_vb2_q_release(filep);
-		legacy_msm_delete_stream(pvdev->vdev->num, sp->stream_id);
+		legacy_msm_delete_stream(session_id, sp->stream_id);
 		mutex_unlock(&session->close_lock);
 	}
 
@@ -880,7 +884,8 @@ static struct v4l2_file_operations camera_v4l2_fops = {
 #endif
 };
 
-int legacy_camera_init_v4l2(struct device *dev, unsigned int *session)
+int legacy_camera_init_v4l2(struct device *dev, unsigned int camera_id,
+	unsigned int *session)
 {
 	struct msm_video_device *pvdev;
 	struct v4l2_device *v4l2_dev;
@@ -941,16 +946,33 @@ int legacy_camera_init_v4l2(struct device *dev, unsigned int *session)
 	pvdev->vdev->ioctl_ops = &camera_v4l2_ioctl_ops;
 	pvdev->vdev->minor     = -1;
 	pvdev->vdev->vfl_type  = VFL_TYPE_GRABBER;
+	/* [pepito] session_id is assigned after video_register_device below,
+	 * where pvdev->vdev->num is valid (see comment there). */
 	rc = video_register_device(pvdev->vdev,
 		VFL_TYPE_GRABBER, -1);
 	if (WARN_ON(rc < 0))
 		goto video_register_fail;
+
+	/*
+	 * [pepito] session_id MUST equal the V4L2 video node number (vdev->num),
+	 * exactly as stock 3.18 (which reads pvdev->vdev->num everywhere). video0
+	 * is the msm-config node, so camera vdevs are video1/video2 -> session
+	 * 1/2, never 0 (QTI imglib rejects session 0 as its empty-slot sentinel).
+	 * It must be vdev->num and NOT camera_id(+1): the mm-camera daemon names
+	 * its HAL IPC socket /data/vendor/camera/cam_socket<session_id>, and the
+	 * HAL connects using the video node number. cell-index+1 desynced the
+	 * front (cell-index 2 -> 3 vs video2) -> cam_socket mismatch ->
+	 * mm_camera_open "cannot open domain socket" -> provider SIGSEGV.
+	 */
+	pvdev->session_id = pvdev->vdev->num;
+	pr_debug("legacy_camera_init_v4l2: camera_id=%u vdev->num=%u -> session_id=%u\n",
+		camera_id, pvdev->vdev->num, pvdev->session_id);
 #if defined(CONFIG_MEDIA_CONTROLLER)
 	/* FIXME: How to get rid of this messy? */
 	pvdev->vdev->entity.name = video_device_node_name(pvdev->vdev);
 #endif
 
-	*session = pvdev->vdev->num;
+	*session = pvdev->session_id;
 	atomic_set(&pvdev->opened, 0);
 	mutex_init(&pvdev->video_drvdata_mutex);
 	video_set_drvdata(pvdev->vdev, pvdev);

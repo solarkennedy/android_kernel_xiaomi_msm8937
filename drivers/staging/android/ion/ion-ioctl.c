@@ -7,12 +7,20 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
+#include <linux/dma-buf.h>
 
 #include "ion.h"
 #include "ion_system_secure_heap.h"
 
 #ifdef CONFIG_ION_LEGACY
 #include "ion_legacy.h"
+/*
+ * [PEPITO-CAM] Legacy A8 camera HAL calls ION_IOC_CUSTOM for cache
+ * maintenance. On 32-bit, ion_custom_data {uint cmd; ulong arg} = 8 bytes,
+ * same size as ion_fd_data. This ioctl number matches the 32-bit HAL's call
+ * and overlaps data.fd in the union (data.fd.fd = custom.arg pointer).
+ */
+#define ION_IOC_CUSTOM_LEGACY _IOWR(ION_IOC_MAGIC, 6, struct ion_fd_data)
 #endif
 
 union ion_ioctl_arg {
@@ -162,6 +170,41 @@ long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case ION_IOC_IMPORT:
 		data.fd.handle = data.fd.fd;
 		break;
+#endif
+#ifdef CONFIG_ION_LEGACY
+	case ION_IOC_CUSTOM_LEGACY:
+	{
+		struct dma_buf *dmabuf;
+		/*
+		 * ion_flush_data layout from a 32-bit process:
+		 *   int handle (4), int fd (4), u32 vaddr (4),
+		 *   uint offset (4), uint length (4) = 20 bytes
+		 */
+		struct {
+			int handle;
+			int fd;
+			u32 vaddr;
+			unsigned int offset;
+			unsigned int length;
+		} flush;
+
+		if (copy_from_user(&flush,
+				   (void __user *)(unsigned long)data.fd.fd,
+				   sizeof(flush)))
+			return -EFAULT;
+
+		if (flush.fd <= 0)
+			return -EINVAL;
+
+		dmabuf = dma_buf_get(flush.fd);
+		if (IS_ERR(dmabuf))
+			return PTR_ERR(dmabuf);
+
+		dma_buf_begin_cpu_access(dmabuf, DMA_BIDIRECTIONAL);
+		dma_buf_end_cpu_access(dmabuf, DMA_BIDIRECTIONAL);
+		dma_buf_put(dmabuf);
+		break;
+	}
 #endif
 	default:
 		return -ENOTTY;
