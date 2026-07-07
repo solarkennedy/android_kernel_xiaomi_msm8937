@@ -593,6 +593,20 @@ static int qcom_smsm_probe(struct platform_device *pdev)
 			goto unwind_interfaces;
 	}
 
+	/*
+	 * [TEMP][pepito] Stock-parity apps SMSM word. The healthy stock-3.18
+	 * AP settles at 0x00001029 = INIT(0x1) | SMDINIT(0x8) | RPCINIT(0x20)
+	 * | PROC_AWAKE(0x1000); our apps entry stays 0 (radio12 SMEM content
+	 * diff — the ONLY AP-written SMEM delta vs stock). INIT/SMDINIT/
+	 * PROC_AWAKE were already tested neutral (radio5-11 handshake patch).
+	 * RPCINIT is the untested bit: stock's ipc_router_smd_xprt raises it
+	 * on IPCRTR channel-open ("apps IPC router up") and it has NO
+	 * QRTR-world writer. The modem is not interrupt-subscribed to it
+	 * (mask 0x00800000), so it must poll it — a direct SMEM read, which
+	 * matches the pre-wire Smem_get_buffer failure shape (radio10).
+	 */
+	smsm_update_bits(smsm, 0, 0x1029);
+
 	platform_set_drvdata(pdev, smsm);
 	of_node_put(local_node);
 
