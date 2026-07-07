@@ -214,6 +214,7 @@ static int qrtr_bcast_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 static void qrtr_handle_del_proc(struct qrtr_node *node, struct sk_buff *skb);
 static void qrtr_cleanup_flow_control(struct qrtr_node *node,
 				      struct sk_buff *skb);
+static void qrtr_hello_reply_and_replay(struct qrtr_node *node);
 
 static void qrtr_log_tx_msg(struct qrtr_node *node, struct qrtr_hdr_v1 *hdr,
 			    struct sk_buff *skb)
@@ -997,6 +998,7 @@ static void qrtr_sock_queue_skb(struct qrtr_node *node, struct sk_buff *skb,
 			return;
 		}
 		atomic_inc(&node->hello_rcvd);
+		qrtr_hello_reply_and_replay(node);
 	}
 
 	rc = sock_queue_rcv_skb(&ipc->sk, skb);
@@ -1148,6 +1150,131 @@ static void qrtr_handle_del_proc(struct qrtr_node *node, struct sk_buff *skb)
 	pkt.cmd = cpu_to_le32(QRTR_TYPE_BYE);
 	skb_store_bits(skb, 0, &pkt, sizeof(pkt));
 	qrtr_local_enqueue(NULL, skb, QRTR_TYPE_BYE, &src, &dst, 0);
+}
+
+/* Local-server replay cache.
+ *
+ * The legacy msm_ipc_router synced the full server table to a remote router
+ * synchronously within the HELLO handshake, so a service could be looked up
+ * by remote firmware the instant its link came up.  On QRTR that job belongs
+ * to the userspace name service, which answers a HELLO milliseconds later —
+ * too late for one-shot lookups done early in remote boot (pepito's AML0
+ * modem probes the RFSA buffer provider inside that gap and fatals with
+ * "EFS: rmts_get_buffer api failed" when it is absent).  Mainline solved
+ * this class of race by moving the name service in-kernel (v5.7 ns.c).
+ *
+ * Here: remember every NEW_SERVER announcement for a local service as it
+ * passes through qrtr_sendmsg(), and replay the set to a node right after
+ * the kernel HELLO in qrtr_hello_work().  The userspace name service still
+ * owns the table; duplicate announcements are idempotent upserts on the
+ * receiving router.
+ */
+struct qrtr_local_server {
+	struct list_head item;
+	u32 service;
+	u32 instance;
+	u32 port;
+};
+static LIST_HEAD(qrtr_local_servers);
+static DEFINE_MUTEX(qrtr_local_servers_lock);
+static unsigned int qrtr_local_server_cnt;
+#define QRTR_LOCAL_SERVERS_MAX 128
+
+static void qrtr_local_server_track(u32 type, struct qrtr_ctrl_pkt *pkt)
+{
+	u32 service = le32_to_cpu(pkt->server.service);
+	u32 instance = le32_to_cpu(pkt->server.instance);
+	u32 port = le32_to_cpu(pkt->server.port);
+	struct qrtr_local_server *srv;
+
+	mutex_lock(&qrtr_local_servers_lock);
+	list_for_each_entry(srv, &qrtr_local_servers, item) {
+		if (srv->service == service && srv->instance == instance) {
+			if (type == QRTR_TYPE_DEL_SERVER) {
+				list_del(&srv->item);
+				kfree(srv);
+				qrtr_local_server_cnt--;
+			} else {
+				srv->port = port;
+			}
+			mutex_unlock(&qrtr_local_servers_lock);
+			return;
+		}
+	}
+	if (type == QRTR_TYPE_NEW_SERVER &&
+	    qrtr_local_server_cnt < QRTR_LOCAL_SERVERS_MAX) {
+		srv = kzalloc(sizeof(*srv), GFP_KERNEL);
+		if (srv) {
+			srv->service = service;
+			srv->instance = instance;
+			srv->port = port;
+			list_add_tail(&srv->item, &qrtr_local_servers);
+			qrtr_local_server_cnt++;
+		}
+	}
+	mutex_unlock(&qrtr_local_servers_lock);
+}
+
+static void qrtr_local_server_replay(struct qrtr_node *node)
+{
+	struct sockaddr_qrtr from = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
+	struct sockaddr_qrtr to = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
+	struct qrtr_local_server *srv;
+	struct qrtr_ctrl_pkt *pkt;
+	struct sk_buff *skb;
+
+	from.sq_node = qrtr_local_nid;
+	to.sq_node = node->nid;
+
+	mutex_lock(&qrtr_local_servers_lock);
+	list_for_each_entry(srv, &qrtr_local_servers, item) {
+		skb = qrtr_alloc_ctrl_packet(&pkt);
+		if (!skb)
+			break;
+		pkt->cmd = cpu_to_le32(QRTR_TYPE_NEW_SERVER);
+		pkt->server.service = cpu_to_le32(srv->service);
+		pkt->server.instance = cpu_to_le32(srv->instance);
+		pkt->server.node = cpu_to_le32(qrtr_local_nid);
+		pkt->server.port = cpu_to_le32(srv->port);
+		qrtr_node_enqueue(node, skb, QRTR_TYPE_NEW_SERVER,
+				  &from, &to, 0);
+	}
+	mutex_unlock(&qrtr_local_servers_lock);
+}
+
+/* Answer a remote router's HELLO and sync it the local server table — the
+ * legacy-router handshake semantic (and what mainline's in-kernel ns does).
+ *
+ * The probe-time kernel HELLO (qrtr_hello_work, queued at endpoint register)
+ * goes out before the remote router has initialized and is addressed to
+ * NID_AUTO; the remote may never see it, and the userspace name service's
+ * later HELLO reply is eaten by the hello_sent dup-gate in
+ * qrtr_node_enqueue().  Result: the remote router's handshake with this node
+ * never completes, and lookups gated on it (e.g. the AML0 modem's
+ * rmts_get_buffer RFSA client) fail even though the table entries were
+ * delivered.  Called from qrtr_sock_queue_skb() on the FIRST HELLO received
+ * from a node (rx kthread context, may sleep).
+ */
+static void qrtr_hello_reply_and_replay(struct qrtr_node *node)
+{
+	struct sockaddr_qrtr from = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
+	struct sockaddr_qrtr to = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
+	struct qrtr_ctrl_pkt *pkt;
+	struct sk_buff *skb;
+
+	from.sq_node = qrtr_local_nid;
+	to.sq_node = node->nid;
+
+	skb = qrtr_alloc_ctrl_packet(&pkt);
+	if (skb) {
+		pkt->cmd = cpu_to_le32(QRTR_TYPE_HELLO);
+		/* Reset the dup-gate: the probe-time HELLO predates the
+		 * remote router's init and must be re-sent as a reply.
+		 */
+		atomic_set(&node->hello_sent, 0);
+		qrtr_node_enqueue(node, skb, QRTR_TYPE_HELLO, &from, &to, 0);
+	}
+	qrtr_local_server_replay(node);
 }
 
 static void qrtr_hello_work(struct kthread_work *work)
@@ -1736,6 +1863,15 @@ static int qrtr_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 		/* control messages already require the type as 'command' */
 		skb_copy_bits(skb, 0, &type, 4);
 		type = le32_to_cpu(type);
+	}
+	/* Track local service announcements for synchronous replay at
+	 * HELLO (see qrtr_local_server_replay).
+	 */
+	if (addr->sq_port == QRTR_PORT_CTRL && len >= sizeof(pkt) &&
+	    (type == QRTR_TYPE_NEW_SERVER || type == QRTR_TYPE_DEL_SERVER)) {
+		skb_copy_bits(skb, 0, &pkt, sizeof(pkt));
+		if (le32_to_cpu(pkt.server.node) == qrtr_local_nid)
+			qrtr_local_server_track(type, &pkt);
 	}
 	if (addr->sq_port == QRTR_PORT_CTRL && type == QRTR_TYPE_NEW_SERVER) {
 		ipc->state = QRTR_STATE_MULTI;
