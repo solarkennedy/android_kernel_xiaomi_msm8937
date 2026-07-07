@@ -93,6 +93,20 @@
 	qcom,msm-hs-micbias-type = "external";
 	qcom,msm-micbias1-ext-cap;
 
+	/*
+	 * PVG100 has no 3.5mm jack.  Delete the MBHC switch props inherited
+	 * from vendor-legacy/qcom/msm8937-audio.dtsi so wcd_mbhc_init() bails
+	 * early and never creates a Headset Jack input device (matches stock
+	 * Palm 3.18, which omits these props).  Without this the WCD MBHC
+	 * false-detects a line-out on the floating sense lines and the UI
+	 * shows "Wired headphones".  The us-euro gpio props are only consumed
+	 * by the (now-dead) MBHC gnd/mic swap path; delete them too.
+	 */
+	/delete-property/ qcom,msm-mbhc-hphl-swh;
+	/delete-property/ qcom,msm-mbhc-gnd-swh;
+	/delete-property/ qcom,cdc-us-euro-gpios;
+	/delete-property/ qcom,cdc-us-eu-gpios;
+
 	qcom,audio-routing =
 		"RX_BIAS", "MCLK",
 		"SPK_RX_BIAS", "MCLK",
@@ -103,6 +117,14 @@
 		"AMIC3", "MIC BIAS External";
 
 	qcom,msm-gpios = "pri_i2s", "quat_i2s";
+	/*
+	 * Quaternary MI2S carries the external I2S to the TFA9896 speaker amp.
+	 * The base msm8937-audio.dtsi only wires pri/quin cdc-pinctrl handles, so
+	 * without this the machine driver's QUAT MI2S startup has a NULL
+	 * mi2s_gpio_p[QUAT_MI2S] and never muxes gpio94/95/12/13 to I2S — the amp
+	 * then sees no bit-clock and its DSP won't start. Node defined below.
+	 */
+	qcom,quat-mi2s-gpios = <&cdc_quat_mi2s_gpios>;
 	qcom,pinctrl-names = "all_off", "pri_i2s_act",
 			     "quat_act", "quat_pri_i2s_act";
 	pinctrl-names = "all_off", "pri_i2s_act",
@@ -111,4 +133,38 @@
 	pinctrl-1 = <&cdc_pdm_lines_act &cdc_pdm_2_lines_act &quat_i2s_sus>;
 	pinctrl-2 = <&cdc_pdm_lines_off &cdc_pdm_2_lines_off &quat_i2s_act>;
 	pinctrl-3 = <&cdc_pdm_lines_act &cdc_pdm_2_lines_act &quat_i2s_act>;
+};
+
+/*
+ * cdc-pinctrl wrapper for the Quaternary MI2S lines (referenced by
+ * qcom,quat-mi2s-gpios above). The machine driver's QUAT MI2S startup toggles
+ * this to mux gpio94/95/12/13 to sec_mi2s (I2S) when speaker audio plays, so the
+ * TFA9896 receives a bit-clock. Mirrors the base cdc_pri/quin_mi2s_gpios nodes.
+ */
+&soc {
+	cdc_quat_mi2s_gpios: msm_cdc_pinctrl_quat {
+		compatible = "qcom,msm-cdc-pinctrl";
+		pinctrl-names = "aud_active", "aud_sleep";
+		pinctrl-0 = <&quat_i2s_act>;
+		pinctrl-1 = <&quat_i2s_sus>;
+	};
+};
+
+/*
+ * External speaker smart-amp: NXP TFA9896 on BLSP2 QUP2 (i2c@7af6000, "i2c_6"),
+ * i2c addr 0x34. GPIOs, bus and address taken from the stock Palm A8.1 pepito DTB.
+ * The bus is declared+disabled in msm8937.dtsi; enable it here and attach the amp.
+ * The tfa98xx driver reads reset-gpio/irq-gpio; vdd (pm8937_l5) is an always-on
+ * rail the driver doesn't manage, so no vdd-supply needed.
+ */
+&i2c_6 {
+	status = "okay";
+
+	tfa98xx@34 {
+		compatible = "nxp,tfa9896";
+		reg = <0x34>;
+		reset-gpio = <&tlmm 125 0>;
+		irq-gpio = <&tlmm 126 0>;
+		rec-gpio = <&tlmm 17 0>;
+	};
 };
