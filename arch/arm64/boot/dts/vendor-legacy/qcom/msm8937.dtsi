@@ -2084,6 +2084,16 @@
 		qcom,override-acc-1 = <0x80800000>;
 		qcom,sysmon-id = <0>;
 		qcom,ssctl-instance-id = <0x12>;
+		/*
+		 * MSS crash-reason SMEM item (MPSS_CRASH_REASON_SMEM = 421).
+		 * pil-q6v5-mss.c log_modem_sfr() defaults q6->smem_id to -1 and
+		 * only reads it from this property; without it the modem's
+		 * "subsystem failure reason: <str>" is never logged. Siblings
+		 * (scuba/bengal/khaje) set the same value. pepito bring-up: needed
+		 * to surface why the modem ERR_FATALs right after EFS access
+		 * (full ramdump is zeros — secure region, no msadp debug policy).
+		 */
+		qcom,smem-id = <421>;
 		qcom,qdsp6v56-1-8-inrush-current;
 		qcom,reset-clk;
 		qcom,iommu-vmid = <0xF>; /* VMID_MSS_MSA */
