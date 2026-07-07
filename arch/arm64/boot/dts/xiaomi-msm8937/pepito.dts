@@ -129,3 +129,26 @@
 &other_ext_mem {
 	reg = <0x0 0x84A00000 0x0 0x1E00000>;
 };
+
+/*
+ * Palm stock DT only exposes the normal QSEECOM heap.  Drop the inherited
+ * TA heap and memory pool while matching this old TZ/keymaster path.
+ */
+/delete-node/ &qseecom_ta_mem;
+
+&soc {
+	qcom,ion {
+		/delete-node/ qcom,ion-heap@19;
+	};
+};
+
+/*
+ * qseecom secapp-region: Palm stock DTB maps the QSEE app loader window at
+ * 0x84A00000 / 25 MiB. The inherited Xiaomi node points at the tail of that
+ * protected range (0x85B00000 / 8 MiB), which does not match Palm TZ.
+ */
+&qcom_seecom {
+	/delete-property/ qcom,commonlib64-loaded-by-uefi;
+	reg = <0x84A00000 0x1900000>;
+	qcom,appsbl-qseecom-support;
+};
