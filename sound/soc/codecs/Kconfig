@@ -993,6 +993,14 @@ config SND_SOC_TFA9879
 	tristate "NXP Semiconductors TFA9879 amplifier"
 	depends on I2C
 
+config SND_SOC_TFA98XX
+	tristate "NXP Semiconductors TFA98XX amplifier"
+	depends on I2C
+	help
+	  Enables support for the NXP/Goodix TFA98xx (TFA9896) smart PA with
+	  on-chip CoolFlux DSP speaker protection. Loads a per-device tuning
+	  container (fw_name, default tfa98xx.cnt). Used by pepito (PVG100).
+
 config SND_SOC_TLV320AIC23
 	tristate
 

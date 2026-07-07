@@ -3812,6 +3812,43 @@ parse_mclk_freq:
 		goto err;
 	}
 
+	/*
+	 * pepito: the QUATERNARY MI2S RX backend physically carries the external
+	 * I2S to the NXP TFA9896 speaker amp, but the base dai-link leaves it on a
+	 * placeholder "snd-soc-dummy" codec. Rebind it to the real TFA codec DAI so
+	 * the amp gets hw_params (sample rate + I2S format) and a stream trigger,
+	 * which lets its on-chip DSP lock the bit-clock and start. Binding it as a
+	 * real dai-link codec (not an aux) is what makes hw_params fire — an aux
+	 * codec never sees the stream, so the amp can't configure or start.
+	 * Self-gated on the tfa9896 DT node so other Mi8937/Mi8917 variants keep
+	 * their dummy QUAT codec untouched.
+	 */
+	{
+		struct device_node *tfa_np =
+			of_find_compatible_node(NULL, NULL, "nxp,tfa9896");
+
+		if (tfa_np) {
+			int i;
+
+			for (i = 0; i < card->num_links; i++) {
+				if (card->dai_link[i].id !=
+					MSM_BACKEND_DAI_QUATERNARY_MI2S_RX)
+					continue;
+				card->dai_link[i].codec_name = "tfa98xx.6-0034";
+				card->dai_link[i].codec_dai_name =
+					"tfa98xx-aif-6-34";
+				card->dai_link[i].codec_of_node = NULL;
+				card->dai_link[i].dai_fmt =
+					SND_SOC_DAIFMT_I2S |
+					SND_SOC_DAIFMT_NB_NF |
+					SND_SOC_DAIFMT_CBS_CFS;
+				dev_info(&pdev->dev,
+					"QUAT_MI2S_RX bound to TFA9896 smart-amp\n");
+			}
+			of_node_put(tfa_np);
+		}
+	}
+
 	ret = devm_snd_soc_register_card(&pdev->dev, card);
 	if (ret) {
 		dev_err(&pdev->dev, "snd_soc_register_card failed (%d)\n",
