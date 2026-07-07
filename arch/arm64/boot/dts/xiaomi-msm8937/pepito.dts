@@ -68,21 +68,35 @@
 /*
  * BLSP1 QUP2 (i2c_2 @ 0x78b6000) is enabled by vendor-legacy/qcom/
  * msm8937-audio.dtsi for the WSA881x speaker codecs.  Lineage's
- * common/audio.dtsi then /delete-node/s those codec children, and
- * pepito has no other consumers on this bus — stock 4.9 pepito DTS
- * leaves &i2c_2 untouched (no wusb3801, no sensors, nothing).  USB-C
- * orientation on pepito is handled internally by the PMI8950 USBIN
- * block, not a discrete CC controller.
+ * common/audio.dtsi then /delete-node/s those codec children.
  *
- * With ZERO children to drive, the i2c-msm-v2 driver still runs HW
- * init at probe time and hangs there (likely in BAM/AXI bus-voting
- * setup, despite qcom,disable-dma being set).  Boot stalls at ~7.28s.
+ * The real stock 3.18 DTB has TWO live children on i2c@78b6000:
+ *   - bhy@28  compatible="bst,bhy" -> Bosch BHy hub = BMI160 accel+gyro
+ *             (pepito's accelerometer; HAL = sensors.native.so).  IRQ
+ *             GPIO 61; supplies vdd_i2c / vdd_1p8 / vdd_2p85.
+ *   - wusb3801x@60 -> discrete USB-C CC/orientation controller.
  *
- * Disable the bus entirely.  Re-enable here and add child nodes only
- * if some future addition (smart-amp, sensor, etc.) actually needs it.
+ * Re-enabled with children present (confirmed working on android8-adb:
+ * 22 h/w sensors including accel/gyro/mag/pressure; [bhy_wq] kernel
+ * thread live).  The zero-child i2c-msm-v2 probe hang is avoided by
+ * having the bhy@28 child.
+ *
+ * NOTE: wusb3801x@60 node not added yet — the 4.19 wusb3801 driver
+ * state is unverified (track separately).
  */
 &i2c_2 {
-	status = "disabled";
+	status = "okay";
+
+	bhy@28 {
+		compatible = "bst,bhy";
+		reg = <0x28>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <61 0x1>;
+		bhy,gpio_irq = <&tlmm 61 0>;
+		bhy,vdd_i2c-supply = <&pm8937_l5>;
+		bhy,vdd_1p8-supply = <&pm8937_l6>;
+		bhy,vdd_2p85-supply = <&pm8937_l10>;
+	};
 };
 
 /*
