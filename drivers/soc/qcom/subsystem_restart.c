@@ -1190,7 +1190,19 @@ static void __subsystem_restart_dev(struct subsys_device *dev)
 			__pm_stay_awake(dev->ssr_wlock);
 			queue_work(ssr_wq, &dev->work);
 		} else {
-			panic("Subsystem %s crashed during SSR!", name);
+			/*
+			 * [TEMP][pepito] Bring-up: the Palm AML0 modem ERR_FATALs
+			 * shortly after powerup once the QRTR/QMI plane engages, so a
+			 * second crash lands inside the restart window (p_state ==
+			 * SUBSYS_RESTARTING) and this would panic the SoC -> boot loop.
+			 * Downgrade to a warning and drop the re-crash; the in-flight
+			 * restart (subsystem_restart_wq_func) finishes normally, so the
+			 * device stays up and we can isolate which QMI interaction kills
+			 * the modem. REVERT once the modem ERR_FATAL is root-caused.
+			 */
+			pr_err_ratelimited(
+				"subsys-restart: %s crashed during SSR - NOT panicking (pepito bring-up), dropping re-crash\n",
+				name);
 		}
 	} else
 		WARN(dev->track.state == SUBSYS_OFFLINE,
