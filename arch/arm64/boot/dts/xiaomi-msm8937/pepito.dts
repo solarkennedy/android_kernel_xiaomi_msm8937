@@ -152,3 +152,40 @@
 	reg = <0x84A00000 0x1900000>;
 	qcom,appsbl-qseecom-support;
 };
+
+/*
+ * RMTFS shared memory — modem EFS transfer buffer.
+ *
+ * reg = <addr_hi addr_lo size_hi size_lo> (root is #address/#size-cells = <2>).
+ * addr = 0x0 => msm_sharedmem allocates coherent DMA memory dynamically
+ * (is_addr_dynamic path); size = 0x180000 (1.5 MiB). This creates /dev/uio0
+ * ("rmtfs") that rmt_storage mmaps and serves to the modem.
+ *
+ * This node is KEPT — it produces the working buffer (/dev/uio0 @ 0xf7300000).
+ *
+ * Two consumers serve this buffer's address to the modem, covering both
+ * buffer-discovery methods seen in the MPSS family:
+ *   1. userspace rmt_storage via RMTFS svc 14 ALLOC_BUFF (the official-4.19 /
+ *      Xiaomi-modem path; rmt_storage reads the address from uio sysfs);
+ *   2. in-kernel RFSA svc 28 GET_BUFF_ADDR (sharedmem_qmi.c re-added from
+ *      stock 3.18; msm_sharedmem probe registers this node via
+ *      sharedmem_qmi_add_entry, keyed by qcom,client-id 1 = MPSS_RMTS_CLIENT_ID).
+ *
+ * History (PLAN-radio.md): the RFSA re-port was removed 2026-07-06 (radio8)
+ * on the theory that announcing svc 28 steered the modem away from
+ * ALLOC_BUFF; that was FALSIFIED the same day — the stock A11's healthy Palm
+ * modem acquires this buffer via RFSA GET_BUFF_ADDR on every boot
+ * (/d/rmt_storage/info Request count increments per modem boot), so RFSA was
+ * re-added (radio9). Necessary but not sufficient: pepito's modem sends ZERO
+ * buffer-provider traffic (no ALLOC_BUFF, no GET_BUFF_ADDR, kernel- or
+ * userspace-hosted — radio10) and fatals modem-internally in its
+ * Smem_get_buffer/method-selection path before any request hits the wire.
+ */
+/ {
+	qcom,rmtfs_sharedmem@0 {
+		compatible = "qcom,sharedmem-uio";
+		reg = <0x0 0x0 0x0 0x180000>;
+		reg-names = "rmtfs";
+		qcom,client-id = <0x00000001>;
+	};
+};
