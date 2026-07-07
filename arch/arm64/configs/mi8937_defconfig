@@ -4056,7 +4056,12 @@ CONFIG_SPS_SUPPORT_NDP_BAM=y
 # CONFIG_GSI is not set
 # CONFIG_IPA3 is not set
 CONFIG_IPA=y
-CONFIG_RMNET_IPA=y
+# [TEMP][pepito] RMNET_IPA disabled: the IPA<->AML0-modem QMI handshake
+# (ipa_v2/ipa_qmi_service.c) drives the 2018 Palm modem to ERR_FATAL once
+# QRTR/qrtr-ns brings the QMI plane up -> double-crash -> SoC panic. Defers
+# IPA-accelerated cellular DATA only; the radio control plane is unaffected.
+# Re-enable (=y) to test IPA-QMI<->AML0 compat for data. See PLAN-radio.md.
+# CONFIG_RMNET_IPA is not set
 # CONFIG_ECM_IPA is not set
 CONFIG_RNDIS_IPA=y
 CONFIG_USB_BAM=y
