@@ -510,15 +510,25 @@ static int card_busy_detect(struct mmc_card *card, unsigned int timeout_ms,
 static int __mmc_blk_ioctl_cmd(struct mmc_card *card, struct mmc_blk_data *md,
 			       struct mmc_blk_ioc_data *idata)
 {
-	struct mmc_command cmd = {}, sbc = {};
+	struct mmc_command cmd = {};
 	struct mmc_data data = {};
 	struct mmc_request mrq = {};
 	struct scatterlist sg;
 	int err;
 	unsigned int target_part;
+	bool is_rpmb;
 
 	if (!card || !md || !idata)
 		return -EINVAL;
+
+	/*
+	 * RPMB accesses arrive either over the RPMB character device
+	 * (idata->rpmb set) or, when CONFIG_MMC_BLOCK_LEGACY_RPMB is
+	 * enabled, over the legacy RPMB block device (md->area_type has
+	 * the RPMB bit). Treat both as RPMB for partition switching,
+	 * reliable-write framing and busy polling.
+	 */
+	is_rpmb = idata->rpmb || (md->area_type & MMC_BLK_DATA_AREA_RPMB);
 
 	/*
 	 * The RPMB accesses comes in from the character device, so we
@@ -586,16 +596,22 @@ static int __mmc_blk_ioctl_cmd(struct mmc_card *card, struct mmc_blk_data *md,
 			return err;
 	}
 
-	if (idata->rpmb) {
-		sbc.opcode = MMC_SET_BLOCK_COUNT;
+	if (is_rpmb) {
 		/*
-		 * We don't do any blockcount validation because the max size
-		 * may be increased by a future standard. We just copy the
-		 * 'Reliable Write' bit here.
+		 * Issue SET_BLOCK_COUNT (CMD23) as an explicit, standalone
+		 * command for RPMB rather than an inline mrq.sbc. On sdhci-msm
+		 * the inline-sbc path engages the Auto-CMD23 hardware engine,
+		 * which the eMMC RPMB partition rejects -> AUTO CMD timeout, a
+		 * stuck RPMB->main partition switch and a controller reset
+		 * (errno 110). The stock 3.18 driver that works with this same
+		 * vendor librpmb also issues CMD23 explicitly here. The
+		 * 'Reliable Write' bit (BIT(31)) is carried in the count arg; no
+		 * blockcount validation since a future standard may raise the max.
 		 */
-		sbc.arg = data.blocks | (idata->ic.write_flag & BIT(31));
-		sbc.flags = MMC_RSP_R1 | MMC_CMD_AC;
-		mrq.sbc = &sbc;
+		err = mmc_set_blockcount(card, data.blocks,
+				idata->ic.write_flag & BIT(31));
+		if (err)
+			return err;
 	}
 
 	if ((MMC_EXTRACT_INDEX_FROM_ARG(cmd.arg) == EXT_CSD_SANITIZE_START) &&
@@ -660,7 +676,7 @@ static int __mmc_blk_ioctl_cmd(struct mmc_card *card, struct mmc_blk_data *md,
 	if (idata->ic.postsleep_min_us)
 		usleep_range(idata->ic.postsleep_min_us, idata->ic.postsleep_max_us);
 
-	if (idata->rpmb || (cmd.flags & MMC_RSP_R1B) == MMC_RSP_R1B) {
+	if (is_rpmb || (cmd.flags & MMC_RSP_R1B) == MMC_RSP_R1B) {
 		/*
 		 * Ensure RPMB/R1B command has completed by polling CMD13
 		 * "Send Status".
@@ -706,7 +722,8 @@ static int mmc_blk_ioctl_cmd(struct mmc_blk_data *md,
 	}
 	idatas[0] = idata;
 	req_to_mmc_queue_req(req)->drv_op =
-		rpmb ? MMC_DRV_OP_IOCTL_RPMB : MMC_DRV_OP_IOCTL;
+		(rpmb || (md->area_type & MMC_BLK_DATA_AREA_RPMB)) ?
+			MMC_DRV_OP_IOCTL_RPMB : MMC_DRV_OP_IOCTL;
 	req_to_mmc_queue_req(req)->drv_op_result = -EIO;
 	req_to_mmc_queue_req(req)->drv_op_data = idatas;
 	req_to_mmc_queue_req(req)->ioc_count = 1;
@@ -776,7 +793,8 @@ static int mmc_blk_ioctl_multi_cmd(struct mmc_blk_data *md,
 		goto cmd_err;
 	}
 	req_to_mmc_queue_req(req)->drv_op =
-		rpmb ? MMC_DRV_OP_IOCTL_RPMB : MMC_DRV_OP_IOCTL;
+		(rpmb || (md->area_type & MMC_BLK_DATA_AREA_RPMB)) ?
+			MMC_DRV_OP_IOCTL_RPMB : MMC_DRV_OP_IOCTL;
 	req_to_mmc_queue_req(req)->drv_op_result = -EIO;
 	req_to_mmc_queue_req(req)->drv_op_data = idata;
 	req_to_mmc_queue_req(req)->ioc_count = num_of_cmds;
@@ -797,6 +815,79 @@ cmd_err:
 	kfree(idata);
 	return ioc_err ? ioc_err : err;
 }
+
+#if IS_ENABLED(CONFIG_MMC_BLOCK_LEGACY_RPMB)
+/*
+ * Legacy RPMB ioctl, re-added for vendor secure-storage stacks (QTI
+ * qseecomd / librpmb) that drive the eMMC RPMB partition via
+ * MMC_IOC_RPMB_CMD on the block device. The mainline RPMB-chardev
+ * conversion dropped this from the block fops; without it those stacks get
+ * -EINVAL on every RPMB read/write, and keymaster/gatekeeper generate/enroll
+ * fail downstream. Pairs with the CONFIG_MMC_BLOCK_LEGACY_RPMB block device.
+ *
+ * The (up to) three commands are executed in order on the RPMB partition;
+ * RPMB routing (partition switch, reliable-write SBC, switch-back-to-main)
+ * comes from md->area_type via __mmc_blk_ioctl_cmd() and the drv_op handler,
+ * so idata->rpmb stays NULL here.
+ */
+static int mmc_blk_ioctl_rpmb_cmd(struct block_device *bdev,
+				  struct mmc_blk_data *md,
+				  struct mmc_ioc_rpmb __user *ic_ptr)
+{
+	struct mmc_blk_ioc_data *idata[MMC_IOC_MAX_RPMB_CMD] = { NULL };
+	struct mmc_ioc_cmd __user *cmds = ic_ptr->cmds;
+	struct mmc_card *card;
+	struct mmc_queue *mq;
+	int i, err = 0, ioc_err = 0;
+	struct request *req;
+
+	for (i = 0; i < MMC_IOC_MAX_RPMB_CMD; i++) {
+		idata[i] = mmc_blk_ioctl_copy_from_user(&cmds[i]);
+		if (IS_ERR(idata[i])) {
+			err = PTR_ERR(idata[i]);
+			idata[i] = NULL;
+			goto cmd_err;
+		}
+		/* RPMB routing is taken from md->area_type, not a chardev. */
+		idata[i]->rpmb = NULL;
+	}
+
+	card = md->queue.card;
+	if (IS_ERR_OR_NULL(card)) {
+		err = card ? PTR_ERR(card) : -ENODEV;
+		goto cmd_err;
+	}
+
+	mq = &md->queue;
+	req = blk_get_request(mq->queue,
+		idata[0]->ic.write_flag ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN, 0);
+	if (IS_ERR(req)) {
+		err = PTR_ERR(req);
+		goto cmd_err;
+	}
+	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_IOCTL_RPMB;
+	req_to_mmc_queue_req(req)->drv_op_result = -EIO;
+	req_to_mmc_queue_req(req)->drv_op_data = idata;
+	req_to_mmc_queue_req(req)->ioc_count = MMC_IOC_MAX_RPMB_CMD;
+	blk_execute_rq(mq->queue, NULL, req, 0);
+	ioc_err = req_to_mmc_queue_req(req)->drv_op_result;
+
+	/* copy to user if data and response */
+	for (i = 0; i < MMC_IOC_MAX_RPMB_CMD && !err; i++)
+		err = mmc_blk_ioctl_copy_to_user(&cmds[i], idata[i]);
+
+	blk_put_request(req);
+
+cmd_err:
+	for (i = 0; i < MMC_IOC_MAX_RPMB_CMD; i++) {
+		if (!idata[i])
+			continue;
+		kfree(idata[i]->buf);
+		kfree(idata[i]);
+	}
+	return ioc_err ? ioc_err : err;
+}
+#endif /* CONFIG_MMC_BLOCK_LEGACY_RPMB */
 
 static int mmc_blk_check_blkdev(struct block_device *bdev)
 {
@@ -841,6 +932,19 @@ static int mmc_blk_ioctl(struct block_device *bdev, fmode_t mode,
 					NULL);
 		mmc_blk_put(md);
 		return ret;
+#if IS_ENABLED(CONFIG_MMC_BLOCK_LEGACY_RPMB)
+	case MMC_IOC_RPMB_CMD:
+		ret = mmc_blk_check_blkdev(bdev);
+		if (ret)
+			return ret;
+		md = mmc_blk_get(bdev->bd_disk);
+		if (!md)
+			return -EINVAL;
+		ret = mmc_blk_ioctl_rpmb_cmd(bdev, md,
+					(struct mmc_ioc_rpmb __user *)arg);
+		mmc_blk_put(md);
+		return ret;
+#endif
 	default:
 		return -EINVAL;
 	}
@@ -1082,13 +1186,20 @@ static void mmc_blk_issue_drv_op(struct mmc_queue *mq, struct request *req)
 
 	switch (mq_rq->drv_op) {
 	case MMC_DRV_OP_IOCTL:
+	case MMC_DRV_OP_IOCTL_RPMB:
+		/*
+		 * Disable the command queue around legacy ioctl commands,
+		 * including RPMB. The RPMB case used to reach this via the
+		 * MMC_DRV_OP_IOCTL fallthrough, which meant RPMB frames were
+		 * issued with CQE still enabled -> sdhci AUTO CMD timeout and a
+		 * stuck RPMB->main partition switch (errno 110). Disable CQ for
+		 * both, then re-enable for both after the access.
+		 */
 		if (card->ext_csd.cmdq_en) {
 			ret = mmc_cmdq_disable(card);
 			if (ret)
 				break;
 		}
-		/* fallthrough */
-	case MMC_DRV_OP_IOCTL_RPMB:
 		idata = mq_rq->drv_op_data;
 		for (i = 0, ret = 0; i < mq_rq->ioc_count; i++) {
 			ret = __mmc_blk_ioctl_cmd(card, md, idata[i]);
@@ -1098,7 +1209,7 @@ static void mmc_blk_issue_drv_op(struct mmc_queue *mq, struct request *req)
 		/* Always switch back to main area after RPMB access */
 		if (rpmb_ioctl)
 			mmc_blk_part_switch(card, 0);
-		else if (card->reenable_cmdq && !card->ext_csd.cmdq_en)
+		if (card->reenable_cmdq && !card->ext_csd.cmdq_en)
 			mmc_cmdq_enable(card);
 		break;
 	case MMC_DRV_OP_BOOT_WP:
@@ -2707,6 +2818,27 @@ static int mmc_blk_alloc_parts(struct mmc_card *card, struct mmc_blk_data *md)
 
 	for (idx = 0; idx < card->nr_parts; idx++) {
 		if (card->part[idx].area_type & MMC_BLK_DATA_AREA_RPMB) {
+#if IS_ENABLED(CONFIG_MMC_BLOCK_LEGACY_RPMB)
+			/*
+			 * Legacy layout: expose the RPMB area as a real block
+			 * device (/dev/block/mmcblkXrpmb) instead of the RPMB
+			 * character device. Vendor secure-storage stacks (e.g.
+			 * QTI qseecomd / librpmb from Android 8) open the RPMB
+			 * block node directly and refuse to start if only the
+			 * character device exists. RPMB traffic is still carried
+			 * over MMC_IOC_*_CMD ioctls; __mmc_blk_ioctl_cmd() and
+			 * the drv_op handler detect the RPMB area_type and route
+			 * the access to the RPMB partition.
+			 */
+			ret = mmc_blk_alloc_part(card, md,
+				card->part[idx].part_cfg,
+				card->part[idx].size >> 9,
+				card->part[idx].force_ro,
+				card->part[idx].name,
+				card->part[idx].area_type);
+			if (ret)
+				return ret;
+#else
 			/*
 			 * RPMB partitions does not provide block access, they
 			 * are only accessed using ioctl():s. Thus create
@@ -2719,6 +2851,7 @@ static int mmc_blk_alloc_parts(struct mmc_card *card, struct mmc_blk_data *md)
 				card->part[idx].name);
 			if (ret)
 				return ret;
+#endif
 		} else if (card->part[idx].size) {
 			ret = mmc_blk_alloc_part(card, md,
 				card->part[idx].part_cfg,

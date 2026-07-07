@@ -72,6 +72,26 @@ config MMC_BLOCK_DEFERRED_RESUME
 	  This will reduce overall resume latency and
 	  save power when there is an SD card inserted but not being used.
 
+config MMC_BLOCK_LEGACY_RPMB
+	bool "Expose eMMC RPMB as a legacy block device"
+	depends on MMC_BLOCK
+	default n
+	help
+	  Expose the eMMC RPMB area as a block device
+	  (/dev/block/mmcblkXrpmb) instead of the modern RPMB character
+	  device (/dev/mmcblkXrpmb).
+
+	  Some vendor secure-storage stacks (for example the Qualcomm
+	  qseecomd / librpmb shipped with Android 8) open the RPMB block
+	  node directly and fail to start their QSEE listener services if
+	  only the character device exists. Enable this to restore the
+	  pre-4.4 block-device layout that those stacks expect.
+
+	  RPMB data is still transferred via MMC_IOC_*_CMD ioctls; only
+	  the device-node type and path change.
+
+	  If unsure, say N.
+
 config SDIO_UART
 	tristate "SDIO UART/GPS class support"
 	depends on TTY

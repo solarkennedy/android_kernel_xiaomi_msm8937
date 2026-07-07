@@ -2761,6 +2761,69 @@ static int __qseecom_check_app_exists(struct qseecom_check_app_ireq req,
 	}
 }
 
+static bool qseecom_pepito_is_interesting_app(const char *app_name)
+{
+	return app_name &&
+		(!strcmp(app_name, "keymaster") ||
+		 !strcmp(app_name, "keymaster64") ||
+		 !strcmp(app_name, "gatekeeper") ||
+		 !strcmp(app_name, "gatekeeper64"));
+}
+
+static int qseecom_pepito_lookup_app(const char *tag, const char *app_name,
+				     u32 *app_id)
+{
+	struct qseecom_check_app_ireq req = {0};
+	int ret;
+
+	req.qsee_cmd_id = QSEOS_APP_LOOKUP_COMMAND;
+	strlcpy(req.app_name, app_name, MAX_APP_NAME_SIZE);
+	ret = __qseecom_check_app_exists(req, app_id);
+	pr_warn("pepito_qsee_lookup[%s]: app=%s ret=%d app_id=%u qsee=0x%x commonlib=%d commonlib64=%d\n",
+		tag, app_name, ret, app_id ? *app_id : 0, qseecom.qsee_version,
+		qseecom.commonlib_loaded, qseecom.commonlib64_loaded);
+
+	return ret;
+}
+
+static void qseecom_pepito_dump_keymaster_buf(const void *vaddr, size_t len,
+					      u32 mdt_len, u32 img_len)
+{
+	static const size_t offsets[] = {
+		0x0,	/* compact .mdt: ELF header / b00 metadata */
+		0x114,	/* compact .mdt: b01 hash/signature metadata */
+		0x1000,	/* interior of compact b01, normally ff padding */
+		0x1b1c,	/* appended duplicate .b00 after keymaster.mdt */
+		0x1c30,	/* appended duplicate .b01 after .mdt + .b00 */
+		0x3638,	/* first .b02 payload byte after .mdt + .b00 + .b01 */
+	};
+	const u8 *buf = vaddr;
+	int i;
+
+	if (!buf)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		size_t off = offsets[i];
+
+		if (off + 16 <= len)
+			pr_info("pepito_load_app buf[%#zx]=%16phN\n",
+				off, buf + off);
+	}
+
+	if (mdt_len >= 16 && mdt_len + 16 <= len)
+		pr_info("pepito_load_app buf[mdt-16=%#x]=%16phN\n",
+			mdt_len - 16, buf + mdt_len - 16);
+
+	if (img_len >= 16 && img_len <= len)
+		pr_info("pepito_load_app buf[img-16=%#x]=%16phN\n",
+			img_len - 16, buf + img_len - 16);
+
+	if (len >= 16)
+		pr_info("pepito_load_app buf[alloc-16=%#zx]=%16phN\n",
+			len - 16, buf + len - 16);
+}
+
 static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 {
 	struct qseecom_registered_app_list *entry = NULL;
@@ -2775,7 +2838,11 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 	struct sg_table *sgt = NULL;
 
 	size_t len;
-	struct qseecom_command_scm_resp resp;
+	struct qseecom_command_scm_resp resp = {0};
+	bool pepito_keymaster_req = false;
+	bool pepito_keymaster64_alias = false;
+	bool pepito_found_registered = false;
+	u32 pepito_client_app_arch;
 	struct qseecom_check_app_ireq req;
 	struct qseecom_load_app_ireq load_req;
 	struct qseecom_load_app_64bit_ireq load_req_64bit;
@@ -2831,11 +2898,45 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 
 	req.qsee_cmd_id = QSEOS_APP_LOOKUP_COMMAND;
 	load_img_req.img_name[MAX_APP_NAME_SIZE-1] = '\0';
+	pepito_client_app_arch = load_img_req.app_arch;
+	pepito_keymaster_req = !strcmp(load_img_req.img_name, "keymaster") ||
+		!strcmp(load_img_req.img_name, "keymaster64");
 	strlcpy(req.app_name, load_img_req.img_name, MAX_APP_NAME_SIZE);
+
+	if (qseecom_pepito_is_interesting_app(load_img_req.img_name))
+		pr_warn("pepito_load_app request: name=%s arch=%u mdt=%u img=%u qsee=0x%x commonlib=%d commonlib64=%d comm=%s\n",
+			load_img_req.img_name, load_img_req.app_arch,
+			load_img_req.mdt_len, load_img_req.img_len,
+			qseecom.qsee_version, qseecom.commonlib_loaded,
+			qseecom.commonlib64_loaded, current->comm);
 
 	ret = __qseecom_check_app_exists(req, &app_id);
 	if (ret < 0)
 		goto loadapp_err;
+
+	if (!app_id && pepito_keymaster_req) {
+		u32 keymaster64_app_id = 0;
+
+		ret = qseecom_pepito_lookup_app("load-app-alias",
+			"keymaster64", &keymaster64_app_id);
+		if (ret < 0)
+			goto loadapp_err;
+		if (keymaster64_app_id) {
+			app_id = keymaster64_app_id;
+			pepito_keymaster64_alias = true;
+			pepito_client_app_arch = 0;
+			pr_warn("pepito_load_app: using preloaded keymaster64 app_id=%u for userspace request %s; dynamic keymaster MDT load bypassed\n",
+				app_id, load_img_req.img_name);
+		} else {
+			pr_err("pepito_load_app: neither %s nor keymaster64 is resident; dynamic keymaster MDT load disabled for this diagnostic\n",
+				load_img_req.img_name);
+			ret = -ENOENT;
+			goto loadapp_err;
+		}
+	}
+
+	if (app_id && !strcmp(load_img_req.img_name, "keymaster64"))
+		pepito_client_app_arch = 0;
 
 	if (app_id) {
 		pr_debug("App id %d (%s) already exists\n", app_id,
@@ -2851,11 +2952,37 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 					goto loadapp_err;
 				}
 				entry->ref_cnt++;
+				pepito_found_registered = true;
 				break;
 			}
 		}
 		spin_unlock_irqrestore(
 			&qseecom.registered_app_list_lock, flags);
+
+		if (!pepito_found_registered && pepito_keymaster64_alias) {
+			entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+			if (!entry) {
+				ret = -ENOMEM;
+				goto loadapp_err;
+			}
+			entry->app_id = app_id;
+			entry->ref_cnt = 1;
+			entry->app_arch = pepito_client_app_arch;
+			strlcpy(entry->app_name, load_img_req.img_name,
+				MAX_APP_NAME_SIZE);
+			entry->app_blocked = false;
+			entry->blocked_on_listener_id = 0;
+			entry->check_block = 0;
+
+			spin_lock_irqsave(&qseecom.registered_app_list_lock,
+				flags);
+			list_add_tail(&entry->list,
+				&qseecom.registered_app_list_head);
+			spin_unlock_irqrestore(
+				&qseecom.registered_app_list_lock, flags);
+			pr_warn("pepito_load_app: registered preloaded keymaster64 app_id=%u as local app %s arch=%u\n",
+				app_id, load_img_req.img_name, pepito_client_app_arch);
+		}
 		ret = 0;
 	} else {
 		first_time = true;
@@ -2877,6 +3004,26 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 			ret = -EINVAL;
 			goto loadapp_err;
 		}
+
+		if (!strcmp(load_img_req.img_name, "keymaster") && sgt &&
+				sgt->sgl) {
+			struct scatterlist *sg = sgt->sgl;
+			phys_addr_t sg_phys_addr = sg_phys(sg);
+			dma_addr_t sg_dma_addr = sg_dma_address(sg);
+
+			pr_info("pepito_load_app dynamic name=%s arch=%u mdt=%u img=%u len=%zu qsee=0x%x commonlib=%d commonlib64=%d\n",
+				load_img_req.img_name, load_img_req.app_arch,
+				load_img_req.mdt_len,
+				load_img_req.img_len, len, qseecom.qsee_version,
+				qseecom.commonlib_loaded,
+				qseecom.commonlib64_loaded);
+			pr_info("pepito_load_app nents=%u orig_nents=%u pa=%pa sg_dma=%pad sg_phys=%pa sg_len=%u sg_off=%u\n",
+				sgt->nents, sgt->orig_nents, &pa, &sg_dma_addr,
+				&sg_phys_addr, sg->length, sg->offset);
+			qseecom_pepito_dump_keymaster_buf(vaddr, len,
+				load_img_req.mdt_len, load_img_req.img_len);
+		}
+
 		/* Populate the structure for sending scm call to load image */
 		if (qseecom.qsee_version < QSEE_VERSION_40) {
 			load_req.qsee_cmd_id = QSEOS_APP_START_COMMAND;
@@ -2908,6 +3055,10 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 		/*  SCM_CALL  to load the app and get the app_id back */
 		ret = qseecom_scm_call(SCM_SVC_TZSCHEDULER, 1, cmd_buf,
 			cmd_len, &resp, sizeof(resp));
+		if (!strcmp(load_img_req.img_name, "keymaster"))
+			pr_info("pepito_load_app scm ret=%d resp.result=%u resp.type=%u resp.data=%u cmd_len=%zu\n",
+				ret, resp.result, resp.resp_type, resp.data,
+				cmd_len);
 		if (ret) {
 			pr_err("scm_call to load app failed\n");
 			ret = -EINVAL;
@@ -2955,7 +3106,7 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 		}
 		entry->app_id = app_id;
 		entry->ref_cnt = 1;
-		entry->app_arch = load_img_req.app_arch;
+		entry->app_arch = pepito_client_app_arch;
 		/*
 		 * keymaster app may be first loaded as "keymaste" by qseecomd,
 		 * and then used as "keymaster" on some targets. To avoid app
@@ -2981,7 +3132,8 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 		(char *)(load_img_req.img_name));
 	}
 	data->client.app_id = app_id;
-	data->client.app_arch = load_img_req.app_arch;
+	data->client.app_arch = pepito_client_app_arch;
+	load_img_req.app_arch = pepito_client_app_arch;
 	if (!strcmp(load_img_req.img_name, "keymaste"))
 		strlcpy(data->client.app_name, "keymaster", MAX_APP_NAME_SIZE);
 	else
@@ -3812,11 +3964,23 @@ static int __qseecom_send_cmd(struct qseecom_dev_handle *data,
 		}
 	}
 
+	if (qseecom_pepito_is_interesting_app(data->client.app_name))
+		pr_warn("pepito_send_cmd enter: app=%s app_id=%u app_arch=%u req_len=%u resp_len=%u is_phys=%d cmd_len=%zu cmd_id=%u whitelist=%d legacy=%d comm=%s\n",
+			data->client.app_name, data->client.app_id,
+			data->client.app_arch, req->cmd_req_len, req->resp_len,
+			is_phys_adr, cmd_len, *(u32 *)cmd_buf,
+			qseecom.whitelist_support, data->use_legacy_cmd,
+			current->comm);
+
 	__qseecom_reentrancy_check_if_this_app_blocked(ptr_app);
 
 	ret = qseecom_scm_call(SCM_SVC_TZSCHEDULER, 1,
 				cmd_buf, cmd_len,
 				&resp, sizeof(resp));
+	if (qseecom_pepito_is_interesting_app(data->client.app_name))
+		pr_warn("pepito_send_cmd scm: app=%s app_id=%u ret=%d resp.result=%u resp.type=%u resp.data=%u\n",
+			data->client.app_name, data->client.app_id, ret,
+			resp.result, resp.resp_type, resp.data);
 	if (ret) {
 		pr_err("scm_call() failed with err: %d (app_id = %d)\n",
 					ret, data->client.app_id);
@@ -3854,6 +4018,9 @@ static int __qseecom_send_cmd(struct qseecom_dev_handle *data,
 		}
 	}
 exit:
+	if (qseecom_pepito_is_interesting_app(data->client.app_name))
+		pr_warn("pepito_send_cmd exit: app=%s app_id=%u ret=%d\n",
+			data->client.app_name, data->client.app_id, ret);
 	return ret;
 }
 
@@ -6003,6 +6170,7 @@ static int qseecom_query_app_loaded(struct qseecom_dev_handle *data,
 	unsigned long flags = 0;
 	uint32_t app_arch = 0, app_id = 0;
 	bool found_app = false;
+	bool pepito_keymaster64_alias = false;
 
 	/* Copy the relevant information needed for loading the image */
 	if (copy_from_user(&query_req, (void __user *)argp,
@@ -6016,10 +6184,32 @@ static int qseecom_query_app_loaded(struct qseecom_dev_handle *data,
 	query_req.app_name[MAX_APP_NAME_SIZE-1] = '\0';
 	strlcpy(req.app_name, query_req.app_name, MAX_APP_NAME_SIZE);
 
+	if (qseecom_pepito_is_interesting_app(query_req.app_name))
+		pr_warn("pepito_app_query request: name=%s data_type=%d comm=%s qsee=0x%x commonlib=%d commonlib64=%d\n",
+			query_req.app_name, data->type, current->comm,
+			qseecom.qsee_version, qseecom.commonlib_loaded,
+			qseecom.commonlib64_loaded);
+
 	ret = __qseecom_check_app_exists(req, &app_id);
 	if (ret) {
 		pr_err(" scm call to check if app is loaded failed\n");
 		goto exit_free;
+	}
+
+	if (!app_id && !strcmp(query_req.app_name, "keymaster")) {
+		u32 keymaster64_app_id = 0;
+
+		ret = qseecom_pepito_lookup_app("query-alias",
+			"keymaster64", &keymaster64_app_id);
+		if (ret)
+			goto exit_free;
+		if (keymaster64_app_id) {
+			app_id = keymaster64_app_id;
+			app_arch = 0;
+			pepito_keymaster64_alias = true;
+			pr_warn("pepito_app_query: aliasing userspace keymaster to preloaded keymaster64 app_id=%u\n",
+				app_id);
+		}
 	}
 	if (app_id) {
 		pr_debug("App id %d (%s) already exists\n", app_id,
@@ -6053,6 +6243,10 @@ static int qseecom_query_app_loaded(struct qseecom_dev_handle *data,
 		}
 		strlcpy(data->client.app_name, query_req.app_name,
 				MAX_APP_NAME_SIZE);
+		if (qseecom_pepito_is_interesting_app(query_req.app_name))
+			pr_warn("pepito_app_query loaded: request=%s alias_keymaster64=%d app_id=%u app_arch=%u found_local=%d\n",
+				query_req.app_name, pepito_keymaster64_alias,
+				app_id, query_req.app_arch, found_app);
 		/*
 		 * If app was loaded by appsbl before and was not registered,
 		 * regiser this app now.
@@ -6089,6 +6283,10 @@ static int qseecom_query_app_loaded(struct qseecom_dev_handle *data,
 		ret = -EEXIST;	/* app already loaded */
 		goto exit_free;
 	}
+
+	if (qseecom_pepito_is_interesting_app(query_req.app_name))
+		pr_warn("pepito_app_query not-loaded: request=%s ret=%d\n",
+			query_req.app_name, ret);
 
 exit_free:
 	return ret;	/* app not loaded */
