@@ -149,6 +149,13 @@ struct qmi_svc_ops_options {
 
 #ifdef CONFIG_MSM_QMI_INTERFACE
 
+/* [pepito qmux] The mainline QRTR qmi helpers (drivers/soc/qcom/
+ * qmi_encdec.c) define a global of the same name with a different type;
+ * rename ours at the preprocessor level so the stock legacy sources stay
+ * byte-verbatim while both stacks link into one image.
+ */
+#define qmi_response_type_v01_ei msm_qmi_response_type_v01_ei
+
 /* Element info array describing common qmi response structure */
 extern struct elem_info qmi_response_type_v01_ei[];
 #define get_qmi_response_type_v01_ei() qmi_response_type_v01_ei
