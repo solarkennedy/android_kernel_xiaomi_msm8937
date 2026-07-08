@@ -838,10 +838,26 @@ static int mmc_blk_ioctl_rpmb_cmd(struct block_device *bdev,
 	struct mmc_ioc_cmd __user *cmds = ic_ptr->cmds;
 	struct mmc_card *card;
 	struct mmc_queue *mq;
-	int i, err = 0, ioc_err = 0;
+	int i, num_cmds, err = 0, ioc_err = 0;
 	struct request *req;
 
 	for (i = 0; i < MMC_IOC_MAX_RPMB_CMD; i++) {
+		u32 opcode;
+
+		/*
+		 * Stop at the first empty slot, like the stock 3.18 handler.
+		 * librpmb sends 2-command transactions (reads) with the third
+		 * slot zeroed; issuing that zeroed slot puts a raw CMD0
+		 * (GO_IDLE) preceded by a CMD23 with count 0 on the bus,
+		 * resetting the card mid-transaction.
+		 */
+		if (get_user(opcode, &cmds[i].opcode)) {
+			err = -EFAULT;
+			goto cmd_err;
+		}
+		if (!opcode)
+			break;
+
 		idata[i] = mmc_blk_ioctl_copy_from_user(&cmds[i]);
 		if (IS_ERR(idata[i])) {
 			err = PTR_ERR(idata[i]);
@@ -851,6 +867,9 @@ static int mmc_blk_ioctl_rpmb_cmd(struct block_device *bdev,
 		/* RPMB routing is taken from md->area_type, not a chardev. */
 		idata[i]->rpmb = NULL;
 	}
+	num_cmds = i;
+	if (!num_cmds)
+		goto cmd_err;
 
 	card = md->queue.card;
 	if (IS_ERR_OR_NULL(card)) {
@@ -868,12 +887,12 @@ static int mmc_blk_ioctl_rpmb_cmd(struct block_device *bdev,
 	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_IOCTL_RPMB;
 	req_to_mmc_queue_req(req)->drv_op_result = -EIO;
 	req_to_mmc_queue_req(req)->drv_op_data = idata;
-	req_to_mmc_queue_req(req)->ioc_count = MMC_IOC_MAX_RPMB_CMD;
+	req_to_mmc_queue_req(req)->ioc_count = num_cmds;
 	blk_execute_rq(mq->queue, NULL, req, 0);
 	ioc_err = req_to_mmc_queue_req(req)->drv_op_result;
 
 	/* copy to user if data and response */
-	for (i = 0; i < MMC_IOC_MAX_RPMB_CMD && !err; i++)
+	for (i = 0; i < num_cmds && !err; i++)
 		err = mmc_blk_ioctl_copy_to_user(&cmds[i], idata[i]);
 
 	blk_put_request(req);
