@@ -1143,7 +1143,17 @@ static void sdhci_prepare_data(struct sdhci_host *host, struct mmc_command *cmd)
 static inline bool sdhci_auto_cmd12(struct sdhci_host *host,
 				    struct mmc_request *mrq)
 {
-	return !mrq->sbc && (host->flags & SDHCI_AUTO_CMD12) &&
+	/*
+	 * Auto-CMD12 is a hardware stand-in for mrq->stop; never emit it for
+	 * requests that did not ask for a stop command. The RPMB/raw-ioctl
+	 * path sends a standalone CMD23 and a CMD25 with neither sbc nor
+	 * stop (predefined block count, self-terminating per JEDEC). The
+	 * eMMC rejects the trailing Auto-CMD12 on the RPMB partition and
+	 * the AUTO_CMD_ERR is reported back as a fake data CRC error
+	 * (-84/EILSEQ), failing every RPMB write. Stock 3.18 sdhci-msm never
+	 * set SDHCI_QUIRK_MULTIBLOCK_READ_ACMD12, so it never hit this.
+	 */
+	return !mrq->sbc && mrq->stop && (host->flags & SDHCI_AUTO_CMD12) &&
 	       !mrq->cap_cmd_during_tfr;
 }
 
@@ -3199,7 +3209,7 @@ static void sdhci_cmd_irq(struct sdhci_host *host, u32 intmask, u32 *intmask_p)
 				   SDHCI_INT_DATA_CRC;
 
 		/* Treat auto-CMD12 error the same as data error */
-		if (!mrq->sbc && (host->flags & SDHCI_AUTO_CMD12)) {
+		if (sdhci_auto_cmd12(host, mrq)) {
 			*intmask_p |= data_err_bit;
 			return;
 		}
