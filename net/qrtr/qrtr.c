@@ -1381,6 +1381,56 @@ static void qrtr_reann_fn(struct work_struct *work)
 			   msecs_to_jiffies(qrtr_reann_interval_ms));
 }
 
+/* qmux/1a probe — legacy msm_ipc_router HELLO payload (PLAN-qmux.md).
+ *
+ * The stock 3.18 router's HELLO is not bare: words 1-4 of the 20-byte
+ * control message carry {checksum, versions, capability, reserved}, where
+ * checksum is a 16-bit one's-complement sum over the whole message seeded
+ * so the receiver's recomputation yields IPC_ROUTER_HELLO_MAGIC — and only
+ * a magic-valid HELLO makes the receiver run protocol version negotiation
+ * (stock ipc_router_core.c do_version_negotiation()).  QRTR sends a bare
+ * zeroed cmd, so the modem's router has seen every boot so far from a
+ * no-negotiation legacy peer.  With the legacy_hello knob set, the
+ * kernel-built HELLOs (probe-time and the per-SSR reply) are dressed in
+ * the stock payload instead.
+ *
+ * legacy_hello_versions defaults to BIT(1) = wire header v1 only.  Stock
+ * advertises 0xA (v1|v3) and the stock pair negotiates v3 — but QRTR
+ * cannot parse ipc-router v3 headers, so advertising BIT(3) risks the
+ * modem switching post-HELLO traffic to a format we drop (RMTFS/EFS would
+ * break until the knob is cleared and the modem SSRs).  0xA stays
+ * available as a deliberate riskier variant.
+ *
+ * Raw u32 math matches the donor: both ends are little-endian and the
+ * donor checksums the in-memory (== on-wire) representation.
+ */
+#define QRTR_IPCR_HELLO_MAGIC 0xE110
+
+static u32 qrtr_legacy_hello;		/* 0 = bare QRTR HELLO (default) */
+static u32 qrtr_legacy_hello_versions = BIT(1);
+
+static void qrtr_legacy_hello_fill(struct qrtr_ctrl_pkt *pkt)
+{
+	u32 *w = (u32 *)pkt;
+	u32 sum = 0;
+	int i;
+
+	BUILD_BUG_ON(sizeof(struct qrtr_ctrl_pkt) != 5 * sizeof(u32));
+
+	if (!qrtr_legacy_hello)
+		return;
+
+	w[1] = QRTR_IPCR_HELLO_MAGIC;	/* checksum seed */
+	w[2] = qrtr_legacy_hello_versions;
+	w[3] = 0;			/* capability (stock 3.18 sends 0) */
+	w[4] = 0;			/* reserved */
+	for (i = 0; i < 5; i++)
+		sum += (w[i] & 0xFFFF) + (w[i] >> 16);
+	while (sum > 0xFFFF)
+		sum = (sum & 0xFFFF) + (sum >> 16);
+	w[1] = ~sum & 0xFFFF;
+}
+
 /* Answer a remote router's HELLO and sync it the local server table — the
  * legacy-router handshake semantic (and what mainline's in-kernel ns does).
  *
@@ -1407,6 +1457,7 @@ static void qrtr_hello_reply_and_replay(struct qrtr_node *node)
 	skb = qrtr_alloc_ctrl_packet(&pkt);
 	if (skb) {
 		pkt->cmd = cpu_to_le32(QRTR_TYPE_HELLO);
+		qrtr_legacy_hello_fill(pkt);
 		/* Reset the dup-gate: the probe-time HELLO predates the
 		 * remote router's init and must be re-sent as a reply.
 		 */
@@ -1516,6 +1567,9 @@ static void qrtr_replay_debugfs_init(void)
 	debugfs_create_u32("reann_duration_ms", 0600, d,
 			   &qrtr_reann_duration_ms);
 	debugfs_create_file("stats", 0400, d, NULL, &qrtr_replay_stats_fops);
+	debugfs_create_u32("legacy_hello", 0600, d, &qrtr_legacy_hello);
+	debugfs_create_x32("legacy_hello_versions", 0600, d,
+			   &qrtr_legacy_hello_versions);
 }
 
 static void qrtr_hello_work(struct kthread_work *work)
@@ -1539,6 +1593,7 @@ static void qrtr_hello_work(struct kthread_work *work)
 
 	node = container_of(work, struct qrtr_node, say_hello);
 	pkt->cmd = cpu_to_le32(QRTR_TYPE_HELLO);
+	qrtr_legacy_hello_fill(pkt);
 	from.sq_node = qrtr_local_nid;
 	to.sq_node = node->nid;
 	qrtr_node_enqueue(node, skb, QRTR_TYPE_HELLO, &from, &to, 0);
