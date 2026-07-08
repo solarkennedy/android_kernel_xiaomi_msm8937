@@ -639,3 +639,12 @@ config GENERIC_LIB_CMPDI2
 
 config GENERIC_LIB_UCMPDI2
 	bool
+
+config QMI_ENCDEC
+	bool "QMI Encode/Decode Library"
+	help
+	  Library to encode & decode QMI messages from within
+	  the kernel. The kernel drivers encode the C structure into
+	  QMI message wire format and then send it over a transport.
+	  The kernel drivers receive the QMI message over a transport
+	  and then decode it into a C structure.

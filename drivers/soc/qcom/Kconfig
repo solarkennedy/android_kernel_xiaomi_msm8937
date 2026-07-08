@@ -261,6 +261,17 @@ config IPC_ROUTER_RPMSG_XPRT
 	  set; with it set, the driver claims the MODEM edge only on the next
 	  channel (re-)probe, i.e. after a modem SSR. adsp/wcnss stay on QRTR.
 
+config MSM_QMI_INTERFACE
+	bool "MSM QMI Interface Library (over IPC Router)"
+	depends on IPC_ROUTER
+	depends on QMI_ENCDEC
+	help
+	  Library to send and receive QMI messages over the legacy IPC
+	  Router (pepito qmux bring-up). Provides the msm-style QCCI/QCSI
+	  kernel API (qmi_handle_create, qmi_svc_register, ...) used by the
+	  stock 3.18 sharedmem_qmi/memshare services. Coexists with the
+	  mainline QRTR-based qmi helpers.
+
 config QCOM_SMEM
 	tristate "Qualcomm Shared Memory Manager (SMEM)"
 	depends on ARCH_QCOM
