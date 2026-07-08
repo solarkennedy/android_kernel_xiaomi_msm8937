@@ -251,6 +251,16 @@ config QCOM_RPMH
 	  of hardware components aggregate requests for these resources and
 	  help apply the aggregated state on the resource.
 
+config IPC_ROUTER_RPMSG_XPRT
+	bool "IPC Router RPMSG transport (modem IPCRTR)"
+	depends on IPC_ROUTER && RPMSG
+	help
+	  Glue between the legacy msm_ipc_router and the modem edge's IPCRTR
+	  SMD channel via the rpmsg qcom_smd driver (pepito qmux bring-up).
+	  Inert unless the ipc_router_rpmsg_xprt.enable module parameter is
+	  set; with it set, the driver claims the MODEM edge only on the next
+	  channel (re-)probe, i.e. after a modem SSR. adsp/wcnss stay on QRTR.
+
 config QCOM_SMEM
 	tristate "Qualcomm Shared Memory Manager (SMEM)"
 	depends on ARCH_QCOM
