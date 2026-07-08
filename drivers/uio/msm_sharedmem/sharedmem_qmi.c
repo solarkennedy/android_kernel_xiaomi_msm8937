@@ -1,13 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/*
- * Copyright (c) 2014-2015, 2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2015, 2017, The Linux Foundation. All rights reserved.
  *
- * In-kernel RFSA (Remote File System Access) QMI service. Replies to the
- * modem's get-buffer-address request with the physical address and size of
- * the shared memory region that the msm_sharedmem UIO driver allocated for
- * each registered client. Ported from the msm-3.18 stock implementation to
- * the 4.19 qmi_handle/qmi_msg_handler server API (modeled on
- * drivers/soc/qcom/memshare/msm_memshare.c).
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
  */
 
 #define DRIVER_NAME "msm_sharedmem"
@@ -19,9 +20,7 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/debugfs.h>
-#include <linux/workqueue.h>
-#include <linux/soc/qcom/qmi.h>
-
+#include <soc/qcom/msm_qmi_interface.h>
 #include "sharedmem_qmi.h"
 #include "remote_filesystem_access_v01.h"
 
@@ -42,17 +41,32 @@ struct shared_addr_list {
 	struct shared_addr_entry entry;
 };
 
-static LIST_HEAD(sharedmem_addr_list);
+static struct shared_addr_list list;
 
 static struct qmi_handle *sharedmem_qmi_svc_handle;
+static void sharedmem_qmi_svc_recv_msg(struct work_struct *work);
+static DECLARE_DELAYED_WORK(work_recv_msg, sharedmem_qmi_svc_recv_msg);
+static struct workqueue_struct *sharedmem_qmi_svc_workqueue;
 static struct dentry *dir_ent;
 
 static u32 rfsa_count;
 static u32 rmts_count;
 
-static DECLARE_RWSEM(sharedmem_list_lock); /* list lock semaphore */
+static DECLARE_RWSEM(sharedmem_list_lock); /* declare list lock semaphore */
 
 static struct work_struct sharedmem_qmi_init_work;
+
+static struct msg_desc rfsa_get_buffer_addr_req_desc = {
+	.max_msg_len = RFSA_GET_BUFF_ADDR_REQ_MSG_MAX_LEN_V01,
+	.msg_id = QMI_RFSA_GET_BUFF_ADDR_REQ_MSG_V01,
+	.ei_array = rfsa_get_buff_addr_req_msg_v01_ei,
+};
+
+static struct msg_desc rfsa_get_buffer_addr_resp_desc = {
+	.max_msg_len = RFSA_GET_BUFF_ADDR_RESP_MSG_MAX_LEN_V01,
+	.msg_id = QMI_RFSA_GET_BUFF_ADDR_RESP_MSG_V01,
+	.ei_array = rfsa_get_buff_addr_resp_msg_v01_ei,
+};
 
 void sharedmem_qmi_add_entry(struct sharemem_qmi_entry *qmi_entry)
 {
@@ -78,9 +92,10 @@ void sharedmem_qmi_add_entry(struct sharemem_qmi_entry *qmi_entry)
 	list_entry->entry.request_count = 0;
 
 	down_write(&sharedmem_list_lock);
-	list_add_tail(&list_entry->node, &sharedmem_addr_list);
+	list_add_tail(&(list_entry->node), &(list.node));
 	up_write(&sharedmem_list_lock);
 	pr_debug("Added new entry to list\n");
+
 }
 
 static int get_buffer_for_client(u32 id, u32 size, u64 *address)
@@ -95,7 +110,7 @@ static int get_buffer_for_client(u32 id, u32 size, u64 *address)
 
 	down_read(&sharedmem_list_lock);
 
-	list_for_each(curr_node, &sharedmem_addr_list) {
+	list_for_each(curr_node, &list.node) {
 		list_entry = list_entry(curr_node, struct shared_addr_list,
 					node);
 		if (list_entry->entry.id == id) {
@@ -122,61 +137,88 @@ static int get_buffer_for_client(u32 id, u32 size, u64 *address)
 	return result;
 }
 
-static void sharedmem_qmi_get_buffer(struct qmi_handle *handle,
-				     struct sockaddr_qrtr *sq,
-				     struct qmi_txn *txn,
-				     const void *decoded_msg)
+static int sharedmem_qmi_get_buffer(void *conn_h, void *req_handle, void *req)
 {
-	struct rfsa_get_buff_addr_req_msg_v01 *req;
-	struct rfsa_get_buff_addr_resp_msg_v01 resp;
-	u64 address = 0;
+	struct rfsa_get_buff_addr_req_msg_v01 *get_buffer_req;
+	struct rfsa_get_buff_addr_resp_msg_v01 get_buffer_resp;
 	int result;
+	u64 address = 0;
 
-	req = (struct rfsa_get_buff_addr_req_msg_v01 *)decoded_msg;
+	get_buffer_req = (struct rfsa_get_buff_addr_req_msg_v01 *)req;
 	pr_debug("req->client_id = 0x%X and req->size = %d\n",
-		req->client_id, req->size);
+		get_buffer_req->client_id, get_buffer_req->size);
 
-	memset(&resp, 0, sizeof(resp));
+	result = get_buffer_for_client(get_buffer_req->client_id,
+					get_buffer_req->size, &address);
+	if (result != 0)
+		return result;
 
-	result = get_buffer_for_client(req->client_id, req->size, &address);
-	if (result == 0 && address != 0) {
-		resp.address_valid = 1;
-		resp.address = address;
-		resp.resp.result = QMI_RESULT_SUCCESS_V01;
-	} else {
-		pr_err("get_buffer failed for client id=0x%X size=%d result=%d\n",
-			req->client_id, req->size, result);
-		resp.resp.result = QMI_RESULT_FAILURE_V01;
-		resp.resp.error = QMI_ERR_INTERNAL_V01;
+	if (address == 0) {
+		pr_err("Entry found for client id= 0x%X but address is zero\n",
+			get_buffer_req->client_id);
+		return -ENOMEM;
 	}
 
-	result = qmi_send_response(sharedmem_qmi_svc_handle, sq, txn,
-				   QMI_RFSA_GET_BUFF_ADDR_RESP_MSG_V01,
-				   sizeof(struct rfsa_get_buff_addr_resp_msg_v01),
-				   rfsa_get_buff_addr_resp_msg_v01_ei, &resp);
-	if (result < 0)
-		pr_err("Error sending get_buffer response: %d\n", result);
+	memset(&get_buffer_resp, 0, sizeof(get_buffer_resp));
+	get_buffer_resp.address_valid = 1;
+	get_buffer_resp.address = address;
+	get_buffer_resp.resp.result = QMI_RESULT_SUCCESS_V01;
+
+	result = qmi_send_resp_from_cb(sharedmem_qmi_svc_handle, conn_h,
+				req_handle,
+				&rfsa_get_buffer_addr_resp_desc,
+				&get_buffer_resp,
+				sizeof(get_buffer_resp));
+	return result;
 }
 
-static struct qmi_msg_handler rfsa_handlers[] = {
-	{
-		.type = QMI_REQUEST,
-		.msg_id = QMI_RFSA_GET_BUFF_ADDR_REQ_MSG_V01,
-		.ei = rfsa_get_buff_addr_req_msg_v01_ei,
-		.decoded_size = sizeof(struct rfsa_get_buff_addr_req_msg_v01),
-		.fn = sharedmem_qmi_get_buffer,
-	},
-	{},
-};
 
-static void sharedmem_qmi_del_client(struct qmi_handle *qmi,
-				     unsigned int node, unsigned int port)
+static int sharedmem_qmi_connect_cb(struct qmi_handle *handle, void *conn_h)
 {
+	if (sharedmem_qmi_svc_handle != handle || !conn_h)
+		return -EINVAL;
+	return 0;
 }
 
-static struct qmi_ops server_ops = {
-	.del_client = sharedmem_qmi_del_client,
-};
+static int sharedmem_qmi_disconnect_cb(struct qmi_handle *handle, void *conn_h)
+{
+	if (sharedmem_qmi_svc_handle != handle || !conn_h)
+		return -EINVAL;
+	return 0;
+}
+
+static int sharedmem_qmi_req_desc_cb(unsigned int msg_id,
+				struct msg_desc **req_desc)
+{
+	int rc;
+
+	switch (msg_id) {
+	case QMI_RFSA_GET_BUFF_ADDR_REQ_MSG_V01:
+		*req_desc = &rfsa_get_buffer_addr_req_desc;
+		rc = sizeof(struct rfsa_get_buff_addr_req_msg_v01);
+		break;
+
+	default:
+		rc = -ENOTSUPP;
+		break;
+	}
+	return rc;
+}
+
+static int sharedmem_qmi_req_cb(struct qmi_handle *handle, void *conn_h,
+				void *req_handle, unsigned int msg_id,
+				void *req)
+{
+	int rc = -ENOTSUPP;
+
+	if (sharedmem_qmi_svc_handle != handle || !conn_h)
+		return -EINVAL;
+
+	if (msg_id == QMI_RFSA_GET_BUFF_ADDR_REQ_MSG_V01)
+		rc = sharedmem_qmi_get_buffer(conn_h, req_handle, req);
+
+	return rc;
+}
 
 #define DEBUG_BUF_SIZE (2048)
 static char *debug_buffer;
@@ -200,7 +242,7 @@ static u32 fill_debug_info(char *buffer, u32 buffer_size)
 	size += scnprintf(buffer + size, buffer_size - size, "\n");
 
 	down_read(&sharedmem_list_lock);
-	list_for_each(curr_node, &sharedmem_addr_list) {
+	list_for_each(curr_node, &list.node) {
 		list_entry = list_entry(curr_node, struct shared_addr_list,
 					node);
 		size += scnprintf(buffer + size, buffer_size - size,
@@ -320,52 +362,82 @@ static void debugfs_init(void)
 static void debugfs_exit(void)
 {
 	debugfs_remove_recursive(dir_ent);
-	dir_ent = NULL;
 	mutex_destroy(&dbg_buf_lock);
+}
+
+static void sharedmem_qmi_svc_recv_msg(struct work_struct *work)
+{
+	int rc;
+
+	do {
+		pr_debug("Notified about a Receive Event\n");
+	} while ((rc = qmi_recv_msg(sharedmem_qmi_svc_handle)) == 0);
+
+	if (rc != -ENOMSG)
+		pr_err("Error receiving message\n");
+}
+
+static void sharedmem_qmi_notify(struct qmi_handle *handle,
+		enum qmi_event_type event, void *priv)
+{
+	switch (event) {
+	case QMI_RECV_MSG:
+		queue_delayed_work(sharedmem_qmi_svc_workqueue,
+				   &work_recv_msg, 0);
+		break;
+	default:
+		break;
+	}
+}
+
+static struct qmi_svc_ops_options sharedmem_qmi_ops_options = {
+	.version = 1,
+	.service_id = RFSA_SERVICE_ID_V01,
+	.service_vers = RFSA_SERVICE_VERS_V01,
+	.service_ins = RFSA_SERVICE_INSTANCE_NUM,
+	.connect_cb = sharedmem_qmi_connect_cb,
+	.disconnect_cb = sharedmem_qmi_disconnect_cb,
+	.req_desc_cb = sharedmem_qmi_req_desc_cb,
+	.req_cb = sharedmem_qmi_req_cb,
+};
+
+
+static void sharedmem_register_qmi(void)
+{
+	int rc;
+
+	sharedmem_qmi_svc_workqueue =
+		create_singlethread_workqueue("sharedmem_qmi_work");
+	if (!sharedmem_qmi_svc_workqueue)
+		return;
+
+	sharedmem_qmi_svc_handle = qmi_handle_create(sharedmem_qmi_notify,
+							NULL);
+	if (!sharedmem_qmi_svc_handle) {
+		pr_err("Creating sharedmem_qmi qmi handle failed\n");
+		destroy_workqueue(sharedmem_qmi_svc_workqueue);
+		return;
+	}
+	rc = qmi_svc_register(sharedmem_qmi_svc_handle,
+				&sharedmem_qmi_ops_options);
+	if (rc < 0) {
+		pr_err("Registering sharedmem_qmi failed %d\n", rc);
+		qmi_handle_destroy(sharedmem_qmi_svc_handle);
+		destroy_workqueue(sharedmem_qmi_svc_workqueue);
+		return;
+	}
+	pr_info("qmi init successful\n");
 }
 
 static void sharedmem_qmi_init_worker(struct work_struct *work)
 {
-	int rc;
-
-	sharedmem_qmi_svc_handle = kzalloc(sizeof(struct qmi_handle),
-					   GFP_KERNEL);
-	if (!sharedmem_qmi_svc_handle)
-		return;
-
-	rc = qmi_handle_init(sharedmem_qmi_svc_handle,
-			     RFSA_GET_BUFF_ADDR_RESP_MSG_MAX_LEN_V01,
-			     &server_ops, rfsa_handlers);
-	if (rc < 0) {
-		pr_err("Creating sharedmem_qmi qmi handle failed: %d\n", rc);
-		kfree(sharedmem_qmi_svc_handle);
-		sharedmem_qmi_svc_handle = NULL;
-		return;
-	}
-
-	rc = qmi_add_server(sharedmem_qmi_svc_handle, RFSA_SERVICE_ID_V01,
-			    RFSA_SERVICE_VERS_V01, RFSA_SERVICE_INSTANCE_NUM);
-	if (rc < 0) {
-		pr_err("Registering sharedmem_qmi server failed: %d\n", rc);
-		qmi_handle_release(sharedmem_qmi_svc_handle);
-		kfree(sharedmem_qmi_svc_handle);
-		sharedmem_qmi_svc_handle = NULL;
-		return;
-	}
-
-	rfsa_count++;
+	sharedmem_register_qmi();
 	debugfs_init();
-	pr_info("RFSA sharedmem_qmi service registered\n");
 }
 
 int sharedmem_qmi_init(void)
 {
-	static bool done;
-
-	if (done)
-		return 0;
-	done = true;
-
+	INIT_LIST_HEAD(&list.node);
 	INIT_WORK(&sharedmem_qmi_init_work, sharedmem_qmi_init_worker);
 	schedule_work(&sharedmem_qmi_init_work);
 	return 0;
@@ -373,12 +445,9 @@ int sharedmem_qmi_init(void)
 
 void sharedmem_qmi_exit(void)
 {
-	cancel_work_sync(&sharedmem_qmi_init_work);
-
-	if (sharedmem_qmi_svc_handle) {
-		qmi_handle_release(sharedmem_qmi_svc_handle);
-		kfree(sharedmem_qmi_svc_handle);
-		sharedmem_qmi_svc_handle = NULL;
-	}
+	qmi_svc_unregister(sharedmem_qmi_svc_handle);
+	flush_workqueue(sharedmem_qmi_svc_workqueue);
+	qmi_handle_destroy(sharedmem_qmi_svc_handle);
+	destroy_workqueue(sharedmem_qmi_svc_workqueue);
 	debugfs_exit();
 }

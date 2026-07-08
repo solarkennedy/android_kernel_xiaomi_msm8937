@@ -10,10 +10,11 @@
  * GNU General Public License for more details.
  *
  */
+
 #ifndef __SHAREDMEM_QMI_H__
 #define __SHAREDMEM_QMI_H__
 
-#include <linux/types.h>
+#include <linux/module.h>
 
 struct sharemem_qmi_entry {
 	const char *client_name;
@@ -24,7 +25,9 @@ struct sharemem_qmi_entry {
 };
 
 int sharedmem_qmi_init(void);
+
 void sharedmem_qmi_exit(void);
+
 void sharedmem_qmi_add_entry(struct sharemem_qmi_entry *qmi_entry);
 
 #endif /* __SHAREDMEM_QMI_H__ */
