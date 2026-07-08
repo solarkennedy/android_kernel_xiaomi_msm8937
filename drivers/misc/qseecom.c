@@ -3964,23 +3964,11 @@ static int __qseecom_send_cmd(struct qseecom_dev_handle *data,
 		}
 	}
 
-	if (qseecom_pepito_is_interesting_app(data->client.app_name))
-		pr_warn("pepito_send_cmd enter: app=%s app_id=%u app_arch=%u req_len=%u resp_len=%u is_phys=%d cmd_len=%zu cmd_id=%u whitelist=%d legacy=%d comm=%s\n",
-			data->client.app_name, data->client.app_id,
-			data->client.app_arch, req->cmd_req_len, req->resp_len,
-			is_phys_adr, cmd_len, *(u32 *)cmd_buf,
-			qseecom.whitelist_support, data->use_legacy_cmd,
-			current->comm);
-
 	__qseecom_reentrancy_check_if_this_app_blocked(ptr_app);
 
 	ret = qseecom_scm_call(SCM_SVC_TZSCHEDULER, 1,
 				cmd_buf, cmd_len,
 				&resp, sizeof(resp));
-	if (qseecom_pepito_is_interesting_app(data->client.app_name))
-		pr_warn("pepito_send_cmd scm: app=%s app_id=%u ret=%d resp.result=%u resp.type=%u resp.data=%u\n",
-			data->client.app_name, data->client.app_id, ret,
-			resp.result, resp.resp_type, resp.data);
 	if (ret) {
 		pr_err("scm_call() failed with err: %d (app_id = %d)\n",
 					ret, data->client.app_id);
@@ -4018,9 +4006,6 @@ static int __qseecom_send_cmd(struct qseecom_dev_handle *data,
 		}
 	}
 exit:
-	if (qseecom_pepito_is_interesting_app(data->client.app_name))
-		pr_warn("pepito_send_cmd exit: app=%s app_id=%u ret=%d\n",
-			data->client.app_name, data->client.app_id, ret);
 	return ret;
 }
 
