@@ -8,6 +8,42 @@
 
 #include <soc/qcom/msm_qmi_interface.h>
 
+/*
+ * The msm-qmi shared qmi_response_type_v01_ei describes the msm
+ * struct qmi_response_type_v01 (two 4-byte enums; error at offset 4).
+ * This tree's uapi struct ipa_qmi_response_type_v01 is the mainline
+ * layout (two u16s; error at offset 2), so encoding with the shared
+ * table reads/writes resp.error at the wrong offset — the modem then
+ * sees error != QMI_ERR_NONE in otherwise-successful responses and
+ * ERR_FATALs (ipa_qmi_client.c:751). Use a local table that matches
+ * the uapi layout.
+ */
+static struct elem_info ipa_qmi_response_type_data_v01_ei[] = {
+	{
+		.data_type	= QMI_SIGNED_2_BYTE_ENUM,
+		.elem_len	= 1,
+		.elem_size	= sizeof(uint16_t),
+		.is_array	= NO_ARRAY,
+		.tlv_type	= QMI_COMMON_TLV_TYPE,
+		.offset		= offsetof(struct ipa_qmi_response_type_v01,
+					result),
+	},
+	{
+		.data_type	= QMI_SIGNED_2_BYTE_ENUM,
+		.elem_len	= 1,
+		.elem_size	= sizeof(uint16_t),
+		.is_array	= NO_ARRAY,
+		.tlv_type	= QMI_COMMON_TLV_TYPE,
+		.offset		= offsetof(struct ipa_qmi_response_type_v01,
+					error),
+	},
+	{
+		.data_type	= QMI_EOTI,
+		.is_array	= NO_ARRAY,
+		.tlv_type	= QMI_COMMON_TLV_TYPE,
+	},
+};
+
 /* Type Definitions  */
 static struct elem_info ipa_hdr_tbl_info_type_data_v01_ei[] = {
 	{
@@ -928,7 +964,7 @@ struct elem_info ipa_init_modem_driver_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_init_modem_driver_resp_msg_v01,
 			resp),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_OPT_FLAG,
@@ -1035,7 +1071,7 @@ struct elem_info ipa_indication_reg_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_indication_reg_resp_msg_v01,
 			resp),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_EOTI,
@@ -1054,7 +1090,7 @@ struct elem_info ipa_master_driver_init_complt_ind_msg_data_v01_ei[] = {
 		.offset		= offsetof(struct
 			ipa_master_driver_init_complt_ind_msg_v01,
 			master_driver_init_status),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_EOTI,
@@ -1202,7 +1238,7 @@ struct elem_info ipa_install_fltr_rule_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_install_fltr_rule_resp_msg_v01,
 			resp),
-		.ei_array       = get_qmi_response_type_v01_ei(),
+		.ei_array       = ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_OPT_FLAG,
@@ -1504,7 +1540,7 @@ struct elem_info ipa_fltr_installed_notif_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_fltr_installed_notif_resp_msg_v01,
 			resp),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_EOTI,
@@ -1571,7 +1607,7 @@ struct elem_info ipa_enable_force_clear_datapath_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_enable_force_clear_datapath_resp_msg_v01,
 			resp),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_EOTI,
@@ -1608,7 +1644,7 @@ struct elem_info ipa_disable_force_clear_datapath_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_disable_force_clear_datapath_resp_msg_v01,
 			resp),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_EOTI,
@@ -1875,7 +1911,7 @@ struct elem_info ipa_config_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_config_resp_msg_v01,
 			resp),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_EOTI,
@@ -2013,7 +2049,7 @@ struct elem_info ipa_get_data_stats_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_get_data_stats_resp_msg_v01,
 			resp),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_OPT_FLAG,
@@ -2241,7 +2277,7 @@ struct elem_info ipa_get_apn_data_stats_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_get_apn_data_stats_resp_msg_v01,
 			resp),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_OPT_FLAG,
@@ -2360,7 +2396,7 @@ struct elem_info ipa_set_data_usage_quota_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_set_data_usage_quota_resp_msg_v01,
 			resp),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_EOTI,
@@ -2408,7 +2444,7 @@ struct elem_info ipa_stop_data_usage_quota_resp_msg_data_v01_ei[] = {
 		.offset		= offsetof(
 			struct ipa_stop_data_usage_quota_resp_msg_v01,
 			resp),
-		.ei_array	= get_qmi_response_type_v01_ei(),
+		.ei_array	= ipa_qmi_response_type_data_v01_ei,
 	},
 	{
 		.data_type	= QMI_EOTI,
