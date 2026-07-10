@@ -18,13 +18,19 @@
  *   larger than the channel FIFO are rejected by rpmsg; router control and
  *   QMI traffic is far below that.
  *
- * Runtime A/B (no reflash): the `enable` module parameter defaults to 0 and
- * the probe then declines every channel, so QRTR keeps the edge exactly as
- * before.  With enable=1 the probe accepts the MODEM edge only (parent DT
- * node with qcom,smd-edge == 0); since drivers/ initcalls precede net/ in
- * link order, this driver out-ranks qcom_smd_qrtr at re-probe time, so a
- * modem SSR after flipping `enable` moves the edge between the two stacks
- * in either direction.  adsp/wcnss always stay on QRTR.
+ * Edge ownership: the `enable` module parameter decides whether this driver
+ * accepts the MODEM edge's IPCRTR channel (parent DT node with
+ * qcom,smd-edge == 0; adsp/wcnss always stay on QRTR).  Since drivers/
+ * initcalls precede net/ in link order, this driver out-ranks qcom_smd_qrtr
+ * whenever the channel probes — at cold boot (the production path) or at the
+ * re-probe after a modem SSR following a runtime write of `enable` (bench
+ * A/B, no reflash).
+ *
+ * enable = 1: ipc_router owns the modem edge; 0: QRTR (the historical
+ * default); -1 (default): auto — on for machines compatible "xiaomi,pepito".
+ * The Palm PVG100 A8 modem only completes its EFS/RFSA boot path against the
+ * legacy router (PLAN-qmux.md), so pepito boots ipc_router-native with no
+ * userspace flip; every other variant keeps QRTR.
  */
 
 #include <linux/module.h>
@@ -39,9 +45,16 @@
 #include <linux/completion.h>
 #include <linux/ipc_router_xprt.h>
 
-static bool enable;
-module_param(enable, bool, 0644);
-MODULE_PARM_DESC(enable, "Accept the modem IPCRTR channel (flip + modem SSR)");
+static int enable = -1;
+module_param(enable, int, 0644);
+MODULE_PARM_DESC(enable, "Modem IPCRTR on ipc_router: 1=on, 0=off (QRTR), -1=auto (on for xiaomi,pepito)");
+
+static bool ipcr_rpmsg_enabled(void)
+{
+	if (enable >= 0)
+		return enable != 0;
+	return of_machine_is_compatible("xiaomi,pepito");
+}
 
 static int debug_mask;
 module_param(debug_mask, int, 0644);
@@ -229,7 +242,7 @@ static int ipcr_rpmsg_probe(struct rpmsg_device *rpdev)
 {
 	struct ipcr_rpmsg_xprt *xprtp;
 
-	if (!enable)
+	if (!ipcr_rpmsg_enabled())
 		return -ENODEV;
 	if (!ipcr_rpmsg_edge_is_modem(rpdev))
 		return -ENODEV;
