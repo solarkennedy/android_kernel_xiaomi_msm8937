@@ -1347,6 +1347,55 @@ static int tfa98xx_set_stop_ctl(struct snd_kcontrol *kcontrol,
 	return 1;
 }
 
+/* "<name> Rec GPIO" — earpiece receiver switch (pepito): the receiver hangs
+ * off the TFA9896's rec-gpio output switch. On = receiver, Off = loudspeaker.
+ * Palm's shipped driver carried this control; it is absent from the GPL dump,
+ * reconstructed here to match the stock mixer_paths interface. */
+static int tfa98xx_info_rec_ctl(struct snd_kcontrol *kcontrol,
+	struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 1;
+
+	return 0;
+}
+
+static int tfa98xx_get_rec_ctl(struct snd_kcontrol *kcontrol,
+	struct snd_ctl_elem_value *ucontrol)
+{
+	struct tfa98xx *tfa98xx;
+	int value = 0;
+
+	mutex_lock(&tfa98xx_mutex);
+	list_for_each_entry(tfa98xx, &tfa98xx_device_list, list) {
+		if (gpio_is_valid(tfa98xx->rec_gpio))
+			value = gpio_get_value_cansleep(tfa98xx->rec_gpio);
+	}
+	mutex_unlock(&tfa98xx_mutex);
+
+	ucontrol->value.integer.value[0] = value;
+
+	return 0;
+}
+
+static int tfa98xx_set_rec_ctl(struct snd_kcontrol *kcontrol,
+	struct snd_ctl_elem_value *ucontrol)
+{
+	struct tfa98xx *tfa98xx;
+	int value = ucontrol->value.integer.value[0] ? 1 : 0;
+
+	mutex_lock(&tfa98xx_mutex);
+	list_for_each_entry(tfa98xx, &tfa98xx_device_list, list) {
+		if (gpio_is_valid(tfa98xx->rec_gpio))
+			gpio_set_value_cansleep(tfa98xx->rec_gpio, value);
+	}
+	mutex_unlock(&tfa98xx_mutex);
+
+	return 1;
+}
+
 static int tfa98xx_info_cal_ctl(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_info *uinfo)
 {
@@ -1420,6 +1469,9 @@ static int tfa98xx_create_controls(struct tfa98xx *tfa98xx)
 
 	if (tfa98xx->flags & TFA98XX_FLAG_CALIBRATION_CTL)
 		nr_controls += 1; /* calibration */
+
+	if (gpio_is_valid(tfa98xx->rec_gpio))
+		nr_controls += 1; /* receiver (earpiece) switch */
 
 	/* allocate the tfa98xx_controls base on the nr of profiles */
 	nprof = tfa_cnt_get_dev_nprof(tfa98xx->tfa);
@@ -1533,6 +1585,20 @@ static int tfa98xx_create_controls(struct tfa98xx *tfa98xx)
 		tfa98xx_controls[mix_index].info = tfa98xx_info_cal_ctl;
 		tfa98xx_controls[mix_index].get = tfa98xx_get_cal_ctl;
 		tfa98xx_controls[mix_index].put = tfa98xx_set_cal_ctl;
+		mix_index++;
+	}
+
+	if (gpio_is_valid(tfa98xx->rec_gpio)) {
+		name = devm_kzalloc(tfa98xx->codec->dev, MAX_CONTROL_NAME, GFP_KERNEL);
+		if (!name)
+			return -ENOMEM;
+
+		scnprintf(name, MAX_CONTROL_NAME, "%s Rec GPIO", tfa98xx->fw.name);
+		tfa98xx_controls[mix_index].name = name;
+		tfa98xx_controls[mix_index].iface = SNDRV_CTL_ELEM_IFACE_MIXER;
+		tfa98xx_controls[mix_index].info = tfa98xx_info_rec_ctl;
+		tfa98xx_controls[mix_index].get = tfa98xx_get_rec_ctl;
+		tfa98xx_controls[mix_index].put = tfa98xx_set_rec_ctl;
 		mix_index++;
 	}
 
@@ -2798,6 +2864,11 @@ static int tfa98xx_parse_dt(struct device *dev, struct tfa98xx *tfa98xx,
 	tfa98xx->irq_gpio = of_get_named_gpio(np, "irq-gpio", 0);
 	if (tfa98xx->irq_gpio < 0)
 		dev_dbg(dev, "No IRQ GPIO provided.\n");
+
+	/* pepito: output switch between loudspeaker and earpiece receiver */
+	tfa98xx->rec_gpio = of_get_named_gpio(np, "rec-gpio", 0);
+	if (tfa98xx->rec_gpio < 0)
+		dev_dbg(dev, "No rec GPIO provided.\n");
 	ret = of_property_read_u32(np, "reset-polarity", &value);
 	if (ret < 0)
 		tfa98xx->reset_polarity = HIGH;
@@ -2971,6 +3042,7 @@ static int tfa98xx_i2c_probe(struct i2c_client *i2c,
 	} else {
 		tfa98xx->reset_gpio = -1;
 		tfa98xx->irq_gpio = -1;
+		tfa98xx->rec_gpio = -1;
 	}
 
 	if (gpio_is_valid(tfa98xx->reset_gpio)) {
@@ -2983,6 +3055,14 @@ static int tfa98xx_i2c_probe(struct i2c_client *i2c,
 	if (gpio_is_valid(tfa98xx->irq_gpio)) {
 		ret = devm_gpio_request_one(&i2c->dev, tfa98xx->irq_gpio,
 			GPIOF_DIR_IN, "TFA98XX_INT");
+		if (ret)
+			return ret;
+	}
+
+	if (gpio_is_valid(tfa98xx->rec_gpio)) {
+		/* default Off = loudspeaker */
+		ret = devm_gpio_request_one(&i2c->dev, tfa98xx->rec_gpio,
+			GPIOF_OUT_INIT_LOW, "TFA98XX_REC");
 		if (ret)
 			return ret;
 	}
