@@ -1822,6 +1822,15 @@ void detect_init_event(struct bhy_client_data *client_data)
 			PDEBUG("ts-3: %lld", g_ts[3]);
 #endif /*~ BHY_DEBUG */
 		}
+		/* The BST HAL blob indexes its per-sensor table with the
+		 * flush-complete param unchecked; the FLUSH_ALL (0xFF) ack
+		 * from bhy_resume reads out of bounds and kills the HAL.
+		 * Drop out-of-range flush acks. */
+		if ((sensor_type == BHY_SENSOR_HANDLE_META_EVENT ||
+			sensor_type == BHY_SENSOR_HANDLE_META_EVENT_WU) &&
+			data[parse_index + 1] == META_EVENT_FLUSH_COMPLETE &&
+			data[parse_index + 2] > BHY_SENSOR_HANDLE_MAX)
+			continue;
 		q->frames[q->head].handle = sensor_type;
 		memcpy(q->frames[q->head].data,
 				&data[parse_index + 1], data_len);
@@ -1920,6 +1929,13 @@ void detect_self_test_event(struct bhy_client_data *client_data)
 					(s8)data[parse_index + 3];
 			result_detected = 1;
 		}
+		/* Drop out-of-range flush-complete acks (see main FIFO
+		 * parse loop): the HAL blob would OOB-read on param 0xFF. */
+		if ((sensor_type == BHY_SENSOR_HANDLE_META_EVENT ||
+			sensor_type == BHY_SENSOR_HANDLE_META_EVENT_WU) &&
+			data[parse_index + 1] == META_EVENT_FLUSH_COMPLETE &&
+			data[parse_index + 2] > BHY_SENSOR_HANDLE_MAX)
+			continue;
 		q->frames[q->head].handle = sensor_type;
 		memcpy(q->frames[q->head].data,
 				&data[parse_index + 1], data_len);
@@ -2062,6 +2078,15 @@ static void bhy_read_fifo_data(struct bhy_client_data *client_data)
 					sensor_type);
 			break;
 		}
+		/* Drop out-of-range flush-complete acks (see main FIFO
+		 * parse loop): the HAL blob would OOB-read on param 0xFF. */
+		if ((sensor_type == BHY_SENSOR_HANDLE_META_EVENT ||
+			sensor_type == BHY_SENSOR_HANDLE_META_EVENT_WU) &&
+			client_data->fifo_buf[parse_index + 1] ==
+				META_EVENT_FLUSH_COMPLETE &&
+			client_data->fifo_buf[parse_index + 2] >
+				BHY_SENSOR_HANDLE_MAX)
+			continue;
 		q->frames[q->head].handle = sensor_type;
 		memcpy(q->frames[q->head].data,
 			&client_data->fifo_buf[parse_index + 1], data_len);
