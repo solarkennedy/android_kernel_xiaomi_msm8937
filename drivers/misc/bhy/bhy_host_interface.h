@@ -294,6 +294,7 @@ struct __attribute__((__packed__)) ram_patch_header {
 #define RESET_FLAG_SELF_TEST	3
 #define RESET_FLAG_ERROR		4
 
+#define META_EVENT_FLUSH_COMPLETE	1
 #define META_EVENT_SELF_TEST_RESULTS	15
 #define META_EVENT_INITIALIZED	16
 
