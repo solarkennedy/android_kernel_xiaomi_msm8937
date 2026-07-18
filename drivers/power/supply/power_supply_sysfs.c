@@ -454,6 +454,7 @@ static struct device_attribute power_supply_attrs[] = {
 	POWER_SUPPLY_ATTR(esr_actual),
 	POWER_SUPPLY_ATTR(esr_nominal),
 	POWER_SUPPLY_ATTR(soh),
+	POWER_SUPPLY_ATTR(state_of_health),
 	POWER_SUPPLY_ATTR(clear_soh),
 	POWER_SUPPLY_ATTR(force_recharge),
 	POWER_SUPPLY_ATTR(fcc_stepper_enable),
