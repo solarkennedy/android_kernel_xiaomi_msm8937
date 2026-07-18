@@ -1080,6 +1080,59 @@ static int get_prop_batt_full_charge(struct smbchg_chip *chip)
 	return bfc;
 }
 
+static int get_prop_batt_cycle_count(struct smbchg_chip *chip)
+{
+	int cc, rc;
+
+	rc = get_property_from_fg(chip, POWER_SUPPLY_PROP_CYCLE_COUNT, &cc);
+	if (rc) {
+		pr_smb(PR_STATUS, "Couldn't get cycle_count rc = %d\n", rc);
+		cc = 0;
+	}
+	return cc;
+}
+
+static int get_prop_batt_charge_full_design(struct smbchg_chip *chip)
+{
+	int cfd, rc;
+
+	rc = get_property_from_fg(chip, POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+				  &cfd);
+	if (rc) {
+		pr_smb(PR_STATUS, "Couldn't get charge_full_design rc = %d\n", rc);
+		cfd = 0;
+	}
+	return cfd;
+}
+
+/*
+ * Battery state-of-health as a percentage, computed from the fuel gauge's
+ * learned full charge vs. design capacity. Exposed as the "state_of_health"
+ * sysfs node so the Android health HAL (BatteryMonitor) can report it in the
+ * Battery Health surface. Returns 0 (unknown) if the FG has no valid data yet.
+ */
+static int get_prop_batt_state_of_health(struct smbchg_chip *chip)
+{
+	int full, design, soh, rc;
+
+	rc = get_property_from_fg(chip, POWER_SUPPLY_PROP_CHARGE_FULL, &full);
+	if (rc)
+		return 0;
+
+	rc = get_property_from_fg(chip, POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+				  &design);
+	if (rc || design <= 0)
+		return 0;
+
+	soh = DIV_ROUND_CLOSEST(full * 100, design);
+	if (soh < 0)
+		soh = 0;
+	else if (soh > 100)
+		soh = 100;
+
+	return soh;
+}
+
 #define DEFAULT_BATT_VOLTAGE_NOW	0
 static int get_prop_batt_voltage_now(struct smbchg_chip *chip)
 {
@@ -5659,6 +5712,9 @@ static enum power_supply_property smbchg_battery_properties[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_RESISTANCE_ID,
 	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
+	POWER_SUPPLY_PROP_STATE_OF_HEALTH,
 	POWER_SUPPLY_PROP_SAFETY_TIMER_ENABLE,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_MAX,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_SETTLED,
@@ -5861,6 +5917,15 @@ static int smbchg_battery_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL:
 		val->intval = get_prop_batt_full_charge(chip);
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+		val->intval = get_prop_batt_charge_full_design(chip);
+		break;
+	case POWER_SUPPLY_PROP_CYCLE_COUNT:
+		val->intval = get_prop_batt_cycle_count(chip);
+		break;
+	case POWER_SUPPLY_PROP_STATE_OF_HEALTH:
+		val->intval = get_prop_batt_state_of_health(chip);
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		val->intval = get_prop_batt_temp(chip);
