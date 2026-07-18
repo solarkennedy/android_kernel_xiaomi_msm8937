@@ -177,6 +177,7 @@ struct fg_cyc_ctr_data {
 	u8			last_soc[BUCKET_COUNT];
 	int			id;
 	struct mutex		lock;
+	char			str[80];	/* space-separated per-bucket dump */
 };
 
 struct fg_iadc_comp_data {
@@ -3029,16 +3030,32 @@ out:
 
 static int fg_get_cycle_count(struct fg_chip *chip)
 {
-	int count;
+	int i, count = 0;
 
 	if (!chip->cyc_ctr.en)
 		return 0;
 
-	if ((chip->cyc_ctr.id <= 0) || (chip->cyc_ctr.id > BUCKET_COUNT))
+	if ((chip->cyc_ctr.id < 0) || (chip->cyc_ctr.id > BUCKET_COUNT))
 		return -EINVAL;
 
 	mutex_lock(&chip->cyc_ctr.lock);
-	count = chip->cyc_ctr.count[chip->cyc_ctr.id - 1];
+	if (chip->cyc_ctr.id == 0) {
+		/*
+		 * id 0 = aggregate. Cycles are tracked per 12.5% SoC bucket
+		 * (see update_cycle_count); the default of reporting only one
+		 * selected bucket (historically bucket 1, the deep-discharge
+		 * band) reads misleadingly low on a lightly-cycled pack. Report
+		 * the max across all buckets instead — the count of near-full
+		 * charges — which is the representative cycle count the Android
+		 * health HAL / Settings expect. A specific id (1..BUCKET_COUNT)
+		 * still returns that bucket for introspection.
+		 */
+		for (i = 0; i < BUCKET_COUNT; i++)
+			if (chip->cyc_ctr.count[i] > count)
+				count = chip->cyc_ctr.count[i];
+	} else {
+		count = chip->cyc_ctr.count[chip->cyc_ctr.id - 1];
+	}
 	mutex_unlock(&chip->cyc_ctr.lock);
 	return count;
 }
@@ -4556,6 +4573,7 @@ static enum power_supply_property fg_power_props[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_MIN,
 	POWER_SUPPLY_PROP_CYCLE_COUNT,
 	POWER_SUPPLY_PROP_CYCLE_COUNT_ID,
+	POWER_SUPPLY_PROP_CYCLE_COUNTS,
 	POWER_SUPPLY_PROP_HI_POWER,
 	POWER_SUPPLY_PROP_SOC_REPORTING_READY,
 	POWER_SUPPLY_PROP_IGNORE_FALSE_NEGATIVE_ISENSE,
@@ -4580,6 +4598,25 @@ static int fg_power_get_property(struct power_supply *psy,
 		else
 			val->strval = chip->batt_type;
 		break;
+	case POWER_SUPPLY_PROP_CYCLE_COUNTS: {
+		/*
+		 * Space-separated per-12.5%-SoC-bucket cycle counts, so a single
+		 * read-only node exposes the whole wear histogram without
+		 * perturbing the cyc_ctr.id selector. Consumed by the
+		 * "Battery wear profile" screen in XiaomiParts.
+		 */
+		int i, len = 0;
+
+		mutex_lock(&chip->cyc_ctr.lock);
+		for (i = 0; i < BUCKET_COUNT; i++)
+			len += scnprintf(chip->cyc_ctr.str + len,
+					sizeof(chip->cyc_ctr.str) - len,
+					(i == BUCKET_COUNT - 1) ? "%d" : "%d ",
+					chip->cyc_ctr.count[i]);
+		mutex_unlock(&chip->cyc_ctr.lock);
+		val->strval = chip->cyc_ctr.str;
+		break;
+	}
 	case POWER_SUPPLY_PROP_CAPACITY:
 		val->intval = get_prop_capacity(chip);
 		break;
@@ -4780,7 +4817,8 @@ static int fg_power_set_property(struct power_supply *psy,
 		}
 		break;
 	case POWER_SUPPLY_PROP_CYCLE_COUNT_ID:
-		if ((val->intval > 0) && (val->intval <= BUCKET_COUNT)) {
+		/* 0 = aggregate (max across buckets); 1..BUCKET_COUNT = per-bucket */
+		if ((val->intval >= 0) && (val->intval <= BUCKET_COUNT)) {
 			chip->cyc_ctr.id = val->intval;
 		} else {
 			pr_err("rejecting invalid cycle_count_id = %d\n",
@@ -7127,7 +7165,7 @@ static int fg_of_init(struct fg_chip *chip)
 	chip->cyc_ctr.en = of_property_read_bool(node,
 				"qcom,cycle-counter-en");
 	if (chip->cyc_ctr.en)
-		chip->cyc_ctr.id = 1;
+		chip->cyc_ctr.id = 0;	/* default to aggregate (max bucket) */
 
 	chip->esr_pulse_tune_en = of_property_read_bool(node,
 					"qcom,esr-pulse-tuning-en");
