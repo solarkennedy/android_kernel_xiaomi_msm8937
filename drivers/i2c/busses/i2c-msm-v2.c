@@ -2951,9 +2951,20 @@ static int i2c_msm_probe(struct platform_device *pdev)
 	if (ret)
 		dev_err(ctrl->dev, "error error on qup software reset\n");
 
-	i2c_msm_pm_clk_disable(ctrl);
-	i2c_msm_pm_clk_unprepare(ctrl);
-	i2c_msm_clk_path_unvote(ctrl);
+	/*
+	 * TEMP bring-up hack: do NOT disable iface_clk/core_clk after probe.
+	 * On 4.19 + earlycon-only console, dropping our CCF vote on
+	 * GCC_BLSP1_AHB_CLK drops the reference count to 0 (the real
+	 * msm_serial driver hasn't probed yet to hold its own vote), which
+	 * gates off the BLSP1 AHB clock. That kills the UART at 0x78b0000
+	 * — the kernel keeps running but no further console output appears,
+	 * which we'd been interpreting as a hang. Leave the clock voted-on
+	 * through probe; runtime PM will manage it later.
+	 *
+	 * i2c_msm_pm_clk_disable(ctrl);
+	 * i2c_msm_pm_clk_unprepare(ctrl);
+	 * i2c_msm_clk_path_unvote(ctrl);
+	 */
 
 	ret = i2c_msm_rsrcs_gpio_pinctrl_init(ctrl);
 	if (ret)
