@@ -21,10 +21,6 @@
 #include <linux/ipc_logging.h>
 #include <linux/uidgid.h>
 #include <linux/pm_wakeup.h>
-#include <linux/debugfs.h>
-#include <linux/delay.h>
-#include <linux/workqueue.h>
-#include <linux/uaccess.h>
 
 #include <net/sock.h>
 #include <uapi/linux/sched/types.h>
@@ -218,7 +214,6 @@ static int qrtr_bcast_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 static void qrtr_handle_del_proc(struct qrtr_node *node, struct sk_buff *skb);
 static void qrtr_cleanup_flow_control(struct qrtr_node *node,
 				      struct sk_buff *skb);
-static void qrtr_hello_reply_and_replay(struct qrtr_node *node);
 
 static void qrtr_log_tx_msg(struct qrtr_node *node, struct qrtr_hdr_v1 *hdr,
 			    struct sk_buff *skb)
@@ -1002,7 +997,6 @@ static void qrtr_sock_queue_skb(struct qrtr_node *node, struct sk_buff *skb,
 			return;
 		}
 		atomic_inc(&node->hello_rcvd);
-		qrtr_hello_reply_and_replay(node);
 	}
 
 	rc = sock_queue_rcv_skb(&ipc->sk, skb);
@@ -1156,422 +1150,6 @@ static void qrtr_handle_del_proc(struct qrtr_node *node, struct sk_buff *skb)
 	qrtr_local_enqueue(NULL, skb, QRTR_TYPE_BYE, &src, &dst, 0);
 }
 
-/* Local-server replay cache.
- *
- * The legacy msm_ipc_router synced the full server table to a remote router
- * synchronously within the HELLO handshake, so a service could be looked up
- * by remote firmware the instant its link came up.  On QRTR that job belongs
- * to the userspace name service, which answers a HELLO milliseconds later —
- * too late for one-shot lookups done early in remote boot (pepito's AML0
- * modem probes the RFSA buffer provider inside that gap and fatals with
- * "EFS: rmts_get_buffer api failed" when it is absent).  Mainline solved
- * this class of race by moving the name service in-kernel (v5.7 ns.c).
- *
- * Here: remember every NEW_SERVER announcement for a local service as it
- * passes through qrtr_sendmsg(), and replay the set to a node right after
- * the kernel HELLO in qrtr_hello_work().  The userspace name service still
- * owns the table; duplicate announcements are idempotent upserts on the
- * receiving router.
- */
-struct qrtr_local_server {
-	struct list_head item;
-	u32 service;
-	u32 instance;
-	u32 port;
-};
-static LIST_HEAD(qrtr_local_servers);
-static DEFINE_MUTEX(qrtr_local_servers_lock);
-static unsigned int qrtr_local_server_cnt;
-#define QRTR_LOCAL_SERVERS_MAX 128
-
-/* Replay-shaping knobs (radio14/P2), debugfs /sys/kernel/debug/qrtr_replay/.
- *
- * Defaults reproduce the pre-knob behavior: full table, back-to-back burst,
- * no re-announce.  Set knobs at runtime, then trigger a modem SSR to run a
- * variant — no reflash between variants.  The hypothesis under test: the
- * modem retains NEW_SERVER(0x1C) only under dialogue conditions the one-shot
- * <1ms full-table burst violates (pacing / ordering / table size / arrival
- * time vs its buffer-path client-init retry window).
- */
-static u32 qrtr_replay_delay_us;	/* gap between replayed NEW_SERVERs */
-static u32 qrtr_replay_first_svc;	/* replay this svc first (0 = table order) */
-#define QRTR_REPLAY_ALLOW_MAX 16
-static u32 qrtr_replay_allow[QRTR_REPLAY_ALLOW_MAX];
-static u32 qrtr_replay_allow_cnt;	/* 0 = replay everything */
-static u32 qrtr_reann_svc;		/* 0 = periodic re-announce disabled */
-static u32 qrtr_reann_inst = 0x101;
-static u32 qrtr_reann_interval_ms = 10;
-static u32 qrtr_reann_duration_ms = 5000;
-/* observability, read via debugfs "stats" */
-static u32 qrtr_replay_last_sent;
-static u32 qrtr_replay_last_skipped;
-static atomic_t qrtr_reann_sent = ATOMIC_INIT(0);
-static u32 qrtr_reann_last_nid;
-
-static bool qrtr_replay_allowed(u32 service)
-{
-	u32 i;
-
-	if (!qrtr_replay_allow_cnt)
-		return true;
-	for (i = 0; i < qrtr_replay_allow_cnt; i++)
-		if (qrtr_replay_allow[i] == service)
-			return true;
-	return false;
-}
-
-static void qrtr_local_server_track(u32 type, struct qrtr_ctrl_pkt *pkt)
-{
-	u32 service = le32_to_cpu(pkt->server.service);
-	u32 instance = le32_to_cpu(pkt->server.instance);
-	u32 port = le32_to_cpu(pkt->server.port);
-	struct qrtr_local_server *srv;
-
-	mutex_lock(&qrtr_local_servers_lock);
-	list_for_each_entry(srv, &qrtr_local_servers, item) {
-		if (srv->service == service && srv->instance == instance) {
-			if (type == QRTR_TYPE_DEL_SERVER) {
-				list_del(&srv->item);
-				kfree(srv);
-				qrtr_local_server_cnt--;
-			} else {
-				srv->port = port;
-			}
-			mutex_unlock(&qrtr_local_servers_lock);
-			return;
-		}
-	}
-	if (type == QRTR_TYPE_NEW_SERVER &&
-	    qrtr_local_server_cnt < QRTR_LOCAL_SERVERS_MAX) {
-		srv = kzalloc(sizeof(*srv), GFP_KERNEL);
-		if (srv) {
-			srv->service = service;
-			srv->instance = instance;
-			srv->port = port;
-			list_add_tail(&srv->item, &qrtr_local_servers);
-			qrtr_local_server_cnt++;
-		}
-	}
-	mutex_unlock(&qrtr_local_servers_lock);
-}
-
-static void qrtr_local_server_replay(struct qrtr_node *node)
-{
-	struct sockaddr_qrtr from = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
-	struct sockaddr_qrtr to = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
-	struct qrtr_local_server *srv, *snap;
-	struct qrtr_ctrl_pkt *pkt;
-	struct sk_buff *skb;
-	u32 cnt = 0, sent = 0, skipped = 0, pass, i;
-
-	from.sq_node = qrtr_local_nid;
-	to.sq_node = node->nid;
-
-	/* Snapshot under the lock, send outside it: pacing (delay_us) must
-	 * not stall qrtr_sendmsg()'s announcement tracking for the whole
-	 * replay.
-	 */
-	snap = kcalloc(QRTR_LOCAL_SERVERS_MAX, sizeof(*snap), GFP_KERNEL);
-	if (!snap)
-		return;
-	mutex_lock(&qrtr_local_servers_lock);
-	list_for_each_entry(srv, &qrtr_local_servers, item) {
-		if (cnt >= QRTR_LOCAL_SERVERS_MAX)
-			break;
-		snap[cnt++] = *srv;
-	}
-	mutex_unlock(&qrtr_local_servers_lock);
-
-	/* pass 0 = first_svc entries only (when set), pass 1 = the rest */
-	for (pass = 0; pass < 2; pass++) {
-		for (i = 0; i < cnt; i++) {
-			bool is_first = qrtr_replay_first_svc &&
-				snap[i].service == qrtr_replay_first_svc;
-
-			if (qrtr_replay_first_svc && (pass == 0) != is_first)
-				continue;
-			if (!qrtr_replay_first_svc && pass == 0)
-				continue;
-			if (!qrtr_replay_allowed(snap[i].service)) {
-				skipped++;
-				continue;
-			}
-			skb = qrtr_alloc_ctrl_packet(&pkt);
-			if (!skb)
-				goto out;
-			pkt->cmd = cpu_to_le32(QRTR_TYPE_NEW_SERVER);
-			pkt->server.service = cpu_to_le32(snap[i].service);
-			pkt->server.instance = cpu_to_le32(snap[i].instance);
-			pkt->server.node = cpu_to_le32(qrtr_local_nid);
-			pkt->server.port = cpu_to_le32(snap[i].port);
-			qrtr_node_enqueue(node, skb, QRTR_TYPE_NEW_SERVER,
-					  &from, &to, 0);
-			sent++;
-			if (qrtr_replay_delay_us)
-				usleep_range(qrtr_replay_delay_us,
-					     qrtr_replay_delay_us + 50);
-		}
-	}
-out:
-	qrtr_replay_last_sent = sent;
-	qrtr_replay_last_skipped = skipped;
-	kfree(snap);
-}
-
-/* Periodic re-announce of ONE service to the node that most recently said
- * HELLO.  Tests whether the modem's server table retains a NEW_SERVER that
- * arrives DURING its buffer-path client-init retry window (~10 retries in
- * the ~40-135ms before the rmts fatal) rather than only in the HELLO-time
- * burst.  Runs on its own ordered workqueue: an enqueue toward a zombie
- * modem can block inside the transport (the known D-state behavior), and
- * that must park only this worker, nothing shared.  The tick re-reads the
- * port from the replay cache, so it follows service re-registration.
- */
-static struct workqueue_struct *qrtr_reann_wq;
-static void qrtr_reann_fn(struct work_struct *work);
-static DECLARE_DELAYED_WORK(qrtr_reann_dwork, qrtr_reann_fn);
-static unsigned long qrtr_reann_deadline;
-
-static void qrtr_reann_fn(struct work_struct *work)
-{
-	struct sockaddr_qrtr from = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
-	struct sockaddr_qrtr to = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
-	struct qrtr_local_server *srv;
-	struct qrtr_ctrl_pkt *pkt;
-	struct qrtr_node *node;
-	struct sk_buff *skb;
-	u32 port = 0;
-
-	if (!qrtr_reann_svc || time_after(jiffies, qrtr_reann_deadline))
-		return;
-
-	mutex_lock(&qrtr_local_servers_lock);
-	list_for_each_entry(srv, &qrtr_local_servers, item) {
-		if (srv->service == qrtr_reann_svc &&
-		    srv->instance == qrtr_reann_inst) {
-			port = srv->port;
-			break;
-		}
-	}
-	mutex_unlock(&qrtr_local_servers_lock);
-
-	node = qrtr_node_lookup(qrtr_reann_last_nid);
-	if (node) {
-		if (port) {
-			skb = qrtr_alloc_ctrl_packet(&pkt);
-			if (skb) {
-				from.sq_node = qrtr_local_nid;
-				to.sq_node = node->nid;
-				pkt->cmd = cpu_to_le32(QRTR_TYPE_NEW_SERVER);
-				pkt->server.service =
-					cpu_to_le32(qrtr_reann_svc);
-				pkt->server.instance =
-					cpu_to_le32(qrtr_reann_inst);
-				pkt->server.node = cpu_to_le32(qrtr_local_nid);
-				pkt->server.port = cpu_to_le32(port);
-				qrtr_node_enqueue(node, skb,
-						  QRTR_TYPE_NEW_SERVER,
-						  &from, &to, 0);
-				atomic_inc(&qrtr_reann_sent);
-			}
-		}
-		qrtr_node_release(node);
-	}
-	queue_delayed_work(qrtr_reann_wq, &qrtr_reann_dwork,
-			   msecs_to_jiffies(qrtr_reann_interval_ms));
-}
-
-/* qmux/1a probe — legacy msm_ipc_router HELLO payload (PLAN-qmux.md).
- *
- * The stock 3.18 router's HELLO is not bare: words 1-4 of the 20-byte
- * control message carry {checksum, versions, capability, reserved}, where
- * checksum is a 16-bit one's-complement sum over the whole message seeded
- * so the receiver's recomputation yields IPC_ROUTER_HELLO_MAGIC — and only
- * a magic-valid HELLO makes the receiver run protocol version negotiation
- * (stock ipc_router_core.c do_version_negotiation()).  QRTR sends a bare
- * zeroed cmd, so the modem's router has seen every boot so far from a
- * no-negotiation legacy peer.  With the legacy_hello knob set, the
- * kernel-built HELLOs (probe-time and the per-SSR reply) are dressed in
- * the stock payload instead.
- *
- * legacy_hello_versions defaults to BIT(1) = wire header v1 only.  Stock
- * advertises 0xA (v1|v3) and the stock pair negotiates v3 — but QRTR
- * cannot parse ipc-router v3 headers, so advertising BIT(3) risks the
- * modem switching post-HELLO traffic to a format we drop (RMTFS/EFS would
- * break until the knob is cleared and the modem SSRs).  0xA stays
- * available as a deliberate riskier variant.
- *
- * Raw u32 math matches the donor: both ends are little-endian and the
- * donor checksums the in-memory (== on-wire) representation.
- */
-#define QRTR_IPCR_HELLO_MAGIC 0xE110
-
-static u32 qrtr_legacy_hello;		/* 0 = bare QRTR HELLO (default) */
-static u32 qrtr_legacy_hello_versions = BIT(1);
-
-static void qrtr_legacy_hello_fill(struct qrtr_ctrl_pkt *pkt)
-{
-	u32 *w = (u32 *)pkt;
-	u32 sum = 0;
-	int i;
-
-	BUILD_BUG_ON(sizeof(struct qrtr_ctrl_pkt) != 5 * sizeof(u32));
-
-	if (!qrtr_legacy_hello)
-		return;
-
-	w[1] = QRTR_IPCR_HELLO_MAGIC;	/* checksum seed */
-	w[2] = qrtr_legacy_hello_versions;
-	w[3] = 0;			/* capability (stock 3.18 sends 0) */
-	w[4] = 0;			/* reserved */
-	for (i = 0; i < 5; i++)
-		sum += (w[i] & 0xFFFF) + (w[i] >> 16);
-	while (sum > 0xFFFF)
-		sum = (sum & 0xFFFF) + (sum >> 16);
-	w[1] = ~sum & 0xFFFF;
-}
-
-/* Answer a remote router's HELLO and sync it the local server table — the
- * legacy-router handshake semantic (and what mainline's in-kernel ns does).
- *
- * The probe-time kernel HELLO (qrtr_hello_work, queued at endpoint register)
- * goes out before the remote router has initialized and is addressed to
- * NID_AUTO; the remote may never see it, and the userspace name service's
- * later HELLO reply is eaten by the hello_sent dup-gate in
- * qrtr_node_enqueue().  Result: the remote router's handshake with this node
- * never completes, and lookups gated on it (e.g. the AML0 modem's
- * rmts_get_buffer RFSA client) fail even though the table entries were
- * delivered.  Called from qrtr_sock_queue_skb() on the FIRST HELLO received
- * from a node (rx kthread context, may sleep).
- */
-static void qrtr_hello_reply_and_replay(struct qrtr_node *node)
-{
-	struct sockaddr_qrtr from = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
-	struct sockaddr_qrtr to = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
-	struct qrtr_ctrl_pkt *pkt;
-	struct sk_buff *skb;
-
-	from.sq_node = qrtr_local_nid;
-	to.sq_node = node->nid;
-
-	skb = qrtr_alloc_ctrl_packet(&pkt);
-	if (skb) {
-		pkt->cmd = cpu_to_le32(QRTR_TYPE_HELLO);
-		qrtr_legacy_hello_fill(pkt);
-		/* Reset the dup-gate: the probe-time HELLO predates the
-		 * remote router's init and must be re-sent as a reply.
-		 */
-		atomic_set(&node->hello_sent, 0);
-		qrtr_node_enqueue(node, skb, QRTR_TYPE_HELLO, &from, &to, 0);
-	}
-	qrtr_local_server_replay(node);
-
-	/* Arm the periodic re-announce window for this node (see
-	 * qrtr_reann_fn); each fresh HELLO (i.e. each SSR) restarts it.
-	 */
-	if (qrtr_reann_svc && qrtr_reann_wq) {
-		qrtr_reann_last_nid = node->nid;
-		atomic_set(&qrtr_reann_sent, 0);
-		qrtr_reann_deadline = jiffies +
-			msecs_to_jiffies(qrtr_reann_duration_ms);
-		mod_delayed_work(qrtr_reann_wq, &qrtr_reann_dwork,
-				 msecs_to_jiffies(qrtr_reann_interval_ms));
-	}
-}
-
-static ssize_t qrtr_replay_allow_write(struct file *file,
-				       const char __user *ubuf,
-				       size_t len, loff_t *ppos)
-{
-	char buf[128];
-	char *s, *tok;
-	u32 val, cnt = 0;
-
-	if (len >= sizeof(buf))
-		return -EINVAL;
-	if (copy_from_user(buf, ubuf, len))
-		return -EFAULT;
-	buf[len] = '\0';
-	s = buf;
-	while ((tok = strsep(&s, ", \n")) != NULL) {
-		if (!*tok)
-			continue;
-		if (cnt >= QRTR_REPLAY_ALLOW_MAX)
-			return -E2BIG;
-		if (kstrtou32(tok, 0, &val))
-			return -EINVAL;
-		qrtr_replay_allow[cnt++] = val;
-	}
-	qrtr_replay_allow_cnt = cnt;
-	return len;
-}
-
-static ssize_t qrtr_replay_allow_read(struct file *file, char __user *ubuf,
-				      size_t len, loff_t *ppos)
-{
-	char buf[QRTR_REPLAY_ALLOW_MAX * 8 + 2];
-	int pos = 0;
-	u32 i;
-
-	for (i = 0; i < qrtr_replay_allow_cnt; i++)
-		pos += scnprintf(buf + pos, sizeof(buf) - pos, "0x%x%s",
-				 qrtr_replay_allow[i],
-				 i + 1 < qrtr_replay_allow_cnt ? "," : "");
-	pos += scnprintf(buf + pos, sizeof(buf) - pos, "\n");
-	return simple_read_from_buffer(ubuf, len, ppos, buf, pos);
-}
-
-static const struct file_operations qrtr_replay_allow_fops = {
-	.open = simple_open,
-	.read = qrtr_replay_allow_read,
-	.write = qrtr_replay_allow_write,
-};
-
-static ssize_t qrtr_replay_stats_read(struct file *file, char __user *ubuf,
-				      size_t len, loff_t *ppos)
-{
-	char buf[160];
-	int pos;
-
-	pos = scnprintf(buf, sizeof(buf),
-			"replay_last_sent %u\nreplay_last_skipped %u\n"
-			"reann_sent %u\nreann_last_nid %u\ncache_cnt %u\n",
-			qrtr_replay_last_sent, qrtr_replay_last_skipped,
-			atomic_read(&qrtr_reann_sent), qrtr_reann_last_nid,
-			qrtr_local_server_cnt);
-	return simple_read_from_buffer(ubuf, len, ppos, buf, pos);
-}
-
-static const struct file_operations qrtr_replay_stats_fops = {
-	.open = simple_open,
-	.read = qrtr_replay_stats_read,
-};
-
-static void qrtr_replay_debugfs_init(void)
-{
-	struct dentry *d;
-
-	qrtr_reann_wq = alloc_ordered_workqueue("qrtr_reann", 0);
-
-	d = debugfs_create_dir("qrtr_replay", NULL);
-	if (IS_ERR_OR_NULL(d))
-		return;
-	debugfs_create_u32("delay_us", 0600, d, &qrtr_replay_delay_us);
-	debugfs_create_x32("first_svc", 0600, d, &qrtr_replay_first_svc);
-	debugfs_create_file("allowlist", 0600, d, NULL,
-			    &qrtr_replay_allow_fops);
-	debugfs_create_x32("reann_svc", 0600, d, &qrtr_reann_svc);
-	debugfs_create_x32("reann_inst", 0600, d, &qrtr_reann_inst);
-	debugfs_create_u32("reann_interval_ms", 0600, d,
-			   &qrtr_reann_interval_ms);
-	debugfs_create_u32("reann_duration_ms", 0600, d,
-			   &qrtr_reann_duration_ms);
-	debugfs_create_file("stats", 0400, d, NULL, &qrtr_replay_stats_fops);
-	debugfs_create_u32("legacy_hello", 0600, d, &qrtr_legacy_hello);
-	debugfs_create_x32("legacy_hello_versions", 0600, d,
-			   &qrtr_legacy_hello_versions);
-}
-
 static void qrtr_hello_work(struct kthread_work *work)
 {
 	struct sockaddr_qrtr from = {AF_QIPCRTR, 0, QRTR_PORT_CTRL};
@@ -1593,7 +1171,6 @@ static void qrtr_hello_work(struct kthread_work *work)
 
 	node = container_of(work, struct qrtr_node, say_hello);
 	pkt->cmd = cpu_to_le32(QRTR_TYPE_HELLO);
-	qrtr_legacy_hello_fill(pkt);
 	from.sq_node = qrtr_local_nid;
 	to.sq_node = node->nid;
 	qrtr_node_enqueue(node, skb, QRTR_TYPE_HELLO, &from, &to, 0);
@@ -2160,15 +1737,6 @@ static int qrtr_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 		skb_copy_bits(skb, 0, &type, 4);
 		type = le32_to_cpu(type);
 	}
-	/* Track local service announcements for synchronous replay at
-	 * HELLO (see qrtr_local_server_replay).
-	 */
-	if (addr->sq_port == QRTR_PORT_CTRL && len >= sizeof(pkt) &&
-	    (type == QRTR_TYPE_NEW_SERVER || type == QRTR_TYPE_DEL_SERVER)) {
-		skb_copy_bits(skb, 0, &pkt, sizeof(pkt));
-		if (le32_to_cpu(pkt.server.node) == qrtr_local_nid)
-			qrtr_local_server_track(type, &pkt);
-	}
 	if (addr->sq_port == QRTR_PORT_CTRL && type == QRTR_TYPE_NEW_SERVER) {
 		ipc->state = QRTR_STATE_MULTI;
 
@@ -2545,7 +2113,6 @@ static int __init qrtr_proto_init(void)
 	}
 
 	qrtr_backup_init();
-	qrtr_replay_debugfs_init();
 
 	return rc;
 }
@@ -2553,10 +2120,6 @@ postcore_initcall(qrtr_proto_init);
 
 static void __exit qrtr_proto_fini(void)
 {
-	if (qrtr_reann_wq) {
-		cancel_delayed_work_sync(&qrtr_reann_dwork);
-		destroy_workqueue(qrtr_reann_wq);
-	}
 	rtnl_unregister(PF_QIPCRTR, RTM_NEWADDR);
 	sock_unregister(qrtr_family.family);
 	proto_unregister(&qrtr_proto);
