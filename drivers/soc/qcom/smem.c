@@ -5,12 +5,9 @@
  * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
-#include <linux/debugfs.h>
 #include <linux/hwspinlock.h>
 #include <linux/io.h>
 #include <linux/module.h>
-#include <linux/sizes.h>
-#include <linux/uaccess.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
@@ -82,10 +79,6 @@
 
 /* Processor/host identifier for the application processor */
 #define SMEM_HOST_APPS		0
-
-/* radio13-lane1: modem SMEM host id (DT smp2p-modem qcom,remote-pid=1;
- * stock msm-3.18 smem.h enum SMEM_APPS=0, SMEM_MODEM=1) */
-#define SMEM_HOST_MODEM_LANE1	1
 
 /* Processor/host identifier for the global partition */
 #define SMEM_GLOBAL_HOST	0xfffe
@@ -1144,154 +1137,6 @@ static int qcom_smem_map_legacy(struct qcom_smem *smem)
 	return 0;
 }
 
-/*
- * Debug instrumentation for the pepito modem bring-up SMEM diff:
- * /sys/kernel/debug/smem_toc — allocated-item table (same format idea as
- * stock msm-3.18 /d/smem/mem, so the two can be diffed directly);
- * /sys/kernel/debug/smem_raw — raw dump of the primary SMEM region, for a
- * byte-level content diff against the stock device.
- * Legacy global-heap layout only (pepito is SMEM v11 legacy).
- */
-static int smem_toc_show(struct seq_file *s, void *unused)
-{
-	struct qcom_smem *smem = s->private;
-	struct smem_header *header = smem->regions[0].virt_base;
-	struct smem_global_entry *entry;
-	u32 count = min_t(u32, smem->item_count, SMEM_ITEM_COUNT);
-	u32 i;
-
-	seq_printf(s, "heap: init=%u free_offset=%08x available=%08x\n",
-		   le32_to_cpu(header->initialized),
-		   le32_to_cpu(header->free_offset),
-		   le32_to_cpu(header->available));
-	for (i = 0; i < count; i++) {
-		entry = &header->toc[i];
-		if (!le32_to_cpu(entry->allocated))
-			continue;
-		seq_printf(s, "%04u: offset %08x size %08x aux %08x\n", i,
-			   le32_to_cpu(entry->offset),
-			   le32_to_cpu(entry->size),
-			   le32_to_cpu(entry->aux_base));
-	}
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(smem_toc);
-
-static ssize_t smem_raw_read(struct file *file, char __user *buf,
-			     size_t count, loff_t *ppos)
-{
-	struct qcom_smem *smem = file->private_data;
-	struct smem_region *region = &smem->regions[0];
-	size_t avail;
-	ssize_t n;
-	void *tmp;
-
-	if (*ppos < 0 || *ppos >= region->size)
-		return 0;
-	avail = region->size - *ppos;
-	n = min_t(size_t, min_t(size_t, count, avail), SZ_4K);
-
-	tmp = kmalloc(n, GFP_KERNEL);
-	if (!tmp)
-		return -ENOMEM;
-	memcpy_fromio(tmp, (const char __iomem *)region->virt_base + *ppos, n);
-	if (copy_to_user(buf, tmp, n)) {
-		kfree(tmp);
-		return -EFAULT;
-	}
-	kfree(tmp);
-	*ppos += n;
-	return n;
-}
-
-/*
- * radio13-lane1: the global smem_raw above covers ONLY regions[0], whose size
- * qcom_smem_map_legacy() clamps to (available + free_offset) = the used global
- * heap. It cannot reach the $TOC partition table (last 4K of the DT region) or
- * the private apps<->remote partitions. This adds:
- *   /d/smem_parts — the ptable ($TOC) entries + each populated per-host
- *                   partition descriptor/header (host0/host1, size, free ptrs);
- *   /d/smem_part_raw — raw dump of partition_desc[SMEM_HOST_MODEM] (the
- *                   apps<->modem private partition), for a byte-level content
- *                   diff stock-vs-ours if a future lane needs partition CONTENT.
- * Read-only. SMEM_HOST_MODEM index below is the QRTR/SMEM host id for the modem.
- */
-static int smem_parts_show(struct seq_file *s, void *unused)
-{
-	struct qcom_smem *smem = s->private;
-	struct smem_partition_header *hdr;
-	unsigned int h;
-
-	if (smem->global_partition_desc.virt_base) {
-		hdr = smem->global_partition_desc.virt_base;
-		seq_printf(s, "global: phys=%08x size=%08x free_unc=%08x free_c=%08x host0=%u host1=%u\n",
-			   smem->global_partition_desc.phys_base,
-			   le32_to_cpu(hdr->size),
-			   le32_to_cpu(hdr->offset_free_uncached),
-			   le32_to_cpu(hdr->offset_free_cached),
-			   le16_to_cpu(hdr->host0), le16_to_cpu(hdr->host1));
-	} else {
-		seq_puts(s, "global: none (SBL legacy heap)\n");
-	}
-
-	for (h = 0; h < SMEM_HOST_COUNT; h++) {
-		struct smem_partition_desc *pd = &smem->partition_desc[h];
-
-		if (!pd->virt_base)
-			continue;
-		hdr = pd->virt_base;
-		seq_printf(s, "host[%u]: phys=%08x size=%08x free_unc=%08x free_c=%08x host0=%u host1=%u cacheline=%u\n",
-			   h, pd->phys_base, le32_to_cpu(hdr->size),
-			   le32_to_cpu(hdr->offset_free_uncached),
-			   le32_to_cpu(hdr->offset_free_cached),
-			   le16_to_cpu(hdr->host0), le16_to_cpu(hdr->host1),
-			   pd->cacheline);
-	}
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(smem_parts);
-
-static ssize_t smem_part_raw_read(struct file *file, char __user *buf,
-				  size_t count, loff_t *ppos)
-{
-	struct qcom_smem *smem = file->private_data;
-	struct smem_partition_desc *pd = &smem->partition_desc[SMEM_HOST_MODEM_LANE1];
-	size_t avail;
-	ssize_t n;
-	void *tmp;
-
-	if (!pd->virt_base)
-		return 0;
-	if (*ppos < 0 || *ppos >= pd->size)
-		return 0;
-	avail = pd->size - *ppos;
-	n = min_t(size_t, min_t(size_t, count, avail), SZ_4K);
-
-	tmp = kmalloc(n, GFP_KERNEL);
-	if (!tmp)
-		return -ENOMEM;
-	memcpy_fromio(tmp, (const char __iomem *)pd->virt_base + *ppos, n);
-	if (copy_to_user(buf, tmp, n)) {
-		kfree(tmp);
-		return -EFAULT;
-	}
-	kfree(tmp);
-	*ppos += n;
-	return n;
-}
-
-static const struct file_operations smem_part_raw_fops = {
-	.open = simple_open,
-	.read = smem_part_raw_read,
-	.llseek = default_llseek,
-};
-
-static const struct file_operations smem_raw_fops = {
-	.open = simple_open,
-	.read = smem_raw_read,
-	.llseek = default_llseek,
-};
-
 static int qcom_smem_probe(struct platform_device *pdev)
 {
 	struct smem_header *header;
@@ -1362,11 +1207,6 @@ static int qcom_smem_probe(struct platform_device *pdev)
 		return ret;
 
 	__smem = smem;
-
-	debugfs_create_file("smem_toc", 0400, NULL, smem, &smem_toc_fops);
-	debugfs_create_file("smem_raw", 0400, NULL, smem, &smem_raw_fops);
-	debugfs_create_file("smem_parts", 0400, NULL, smem, &smem_parts_fops);
-	debugfs_create_file("smem_part_raw", 0400, NULL, smem, &smem_part_raw_fops);
 
 	return 0;
 }
