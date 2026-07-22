@@ -278,6 +278,10 @@ int bhy_resume(struct device *dev);
 int bhy_probe(struct bhy_data_bus *data_bus);
 int bhy_remove(struct device *dev);
 
+/* bhy_i2c.c -- drop the bus circuit breaker so a recovery attempt is
+ * allowed to re-drive the bus the breaker tripped on. */
+void bhy_i2c_clear_degraded(void);
+
 #ifdef CONFIG_PM
 int bhy_suspend(struct device *dev);
 int bhy_resume(struct device *dev);
