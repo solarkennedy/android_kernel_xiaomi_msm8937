@@ -1386,22 +1386,6 @@ static int __init clock_late_init(void)
 	}
 
 	list_for_each_entry_safe(h, h_temp, &handoff_list, list) {
-		/*
-		 * Pepito (MSM8940 + stock Palm TZ 8.1): dropping
-		 * gcc_blsp1_uart2_apps_clk trips a TZ PS_HOLD assertion.
-		 * TZ keeps its own debug console on BLSP1 UART2 and fires
-		 * PS_HOLD when the kernel removes the clock from under it.
-		 * Confirmed via ramoops: every clock through usb_hs_system_clk_src
-		 * completes; this is the last line logged before the reset.
-		 * Leave the bootloader's vote in place — the UART driver will
-		 * re-vote when it probes.
-		 */
-		if (h->clk->dbg_name &&
-		    !strcmp(h->clk->dbg_name, "gcc_blsp1_uart2_apps_clk")) {
-			list_del(&h->list);
-			kfree(h);
-			continue;
-		}
 		clk_disable_unprepare(h->clk);
 		list_del(&h->list);
 		kfree(h);
