@@ -21,6 +21,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/input.h>
+#include <linux/jiffies.h>
 
 #include "bhy_core.h"
 #include "bs_log.h"
@@ -28,6 +29,104 @@
 #define BHY_MAX_RETRY_I2C_XFER		10
 #define BHY_I2C_WRITE_DELAY_TIME	1000
 #define BHY_I2C_MAX_BURST_WRITE_LEN	64
+
+/*
+ * Circuit breaker: a fully-exhausted BHY_MAX_RETRY_I2C_XFER loop already
+ * costs ~10 * (i2c-msm-v2's own per-xfer timeout, ~2.3s when the bus is
+ * wedged) = tens of seconds. bhy_read_fifo_data() is called again on every
+ * subsequent FIFO-ready IRQ with no backoff of its own, so a bus that stays
+ * wedged previously meant each IRQ re-ran the full ~23s retry loop back to
+ * back, and since every bhy_i2c_read/write call is serialized under
+ * client_data->mutex_bus_op, that also starves the sensors HAL's whole
+ * binder thread pool for the same duration (first observed 2026-07-16: ~47s
+ * of continuous I2C timeouts froze WindowManager's orientation-listener
+ * enable/disable, cascading into a ~143s system-wide ANR after an Android
+ * Auto USB connection).
+ *
+ * Once a full retry cycle is exhausted, fail fast for a cooldown instead of
+ * immediately repeating it -- this bounds the worst case to one ~23s stall
+ * instead of compounding indefinitely, and frees the binder thread pool
+ * quickly so unrelated sensor/HAL calls aren't starved by a single wedged
+ * transaction.
+ *
+ * The original 2000ms cooldown was measured (2026-07-16, second real-hardware
+ * test) to be too short to actually engage: individual failed attempts were
+ * recurring every ~2.2-2.4s (a single attempt's own i2c-msm-v2 timeout was
+ * ~2.37s and climbing, since each retry re-reads a growing FIFO backlog and
+ * the per-xfer timeout scales with byte count -- see
+ * i2c_msm_xfer_calc_timeout() in i2c-msm-v2.c), so the cooldown window was
+ * *shorter* than the caller's own natural retry interval and had expired by
+ * the time the next call arrived -- 170 back-to-back timeouts over 6+
+ * minutes, no throttling. Widened well past the observed cadence so a
+ * detected wedge actually gets breathing room.
+ *
+ * Root cause found 2026-07-16, and it is NOT what the paragraphs above
+ * assume. The bus is not wedged at all -- only the hub is. In a full
+ * reproduction, all 76 TIMEOUT_ERRORs were slv_addr:0x28 (this chip) and
+ * *zero* were 0x60, while the wusb3801 driver on the same bus read 0x60
+ * successfully throughout the storm; a wedged bus would have failed those
+ * too. Nor is USB the trigger: the storm began 2m42s after a plug and kept
+ * climbing after unplug. What actually precedes it is suspend/resume churn
+ * (42 wcnss_wlan resumes in 51s; bhy died 376ms after the full wake that
+ * ended the burst), i.e. the hub hangs and stops answering.
+ *
+ * So this cooldown is not the fix -- it is damage control, and it works:
+ * it bounds the stall and keeps the system responsive (measured cadence =
+ * 15s cooldown + one ~2.37s retry, no ANR). The actual repair is making
+ * the driver's existing recovery reachable (see check_watchdog_reset() and
+ * reset() in bhy_core.c) so the hub gets reset instead of retried forever.
+ * Note bhy_i2c_clear_degraded() below exists precisely so this breaker
+ * cannot block that recovery.
+ */
+#define BHY_I2C_FAIL_COOLDOWN_MS	15000
+static unsigned long bhy_i2c_last_fail_jiffies;
+static bool bhy_i2c_bus_degraded;
+
+static bool bhy_i2c_cooldown_active(void)
+{
+	if (!bhy_i2c_bus_degraded)
+		return false;
+
+	if (time_after(jiffies,
+			bhy_i2c_last_fail_jiffies +
+			msecs_to_jiffies(BHY_I2C_FAIL_COOLDOWN_MS))) {
+		bhy_i2c_bus_degraded = false;
+		return false;
+	}
+
+	return true;
+}
+
+static void bhy_i2c_note_result(int ret)
+{
+	if (ret < 0) {
+		bhy_i2c_bus_degraded = true;
+		bhy_i2c_last_fail_jiffies = jiffies;
+	} else {
+		bhy_i2c_bus_degraded = false;
+	}
+}
+
+/*
+ * Drop the breaker on demand, for reset() in bhy_core.c.
+ *
+ * The recovery path reloads the RAM patch over this same bus, but it only
+ * runs *because* the bus wedged -- so the cooldown is essentially always
+ * armed by the time it starts, and would fail-fast (-EIO) every op of the
+ * reload, including the BHY_REG_RESET_REQ write meant to soft-reset the
+ * MCU. The breaker would thus block the one thing that can clear the
+ * condition it exists to survive, and the sensors would stay dead exactly
+ * as if no recovery existed at all.
+ *
+ * Anything the breaker learned describes the hub state we are about to
+ * tear down, so it is stale by construction at that point. If the reload
+ * genuinely cannot get through, the very first failure re-arms it.
+ */
+void bhy_i2c_clear_degraded(void)
+{
+	bhy_i2c_bus_degraded = false;
+}
+EXPORT_SYMBOL(bhy_i2c_clear_degraded);
 
 static s32 bhy_i2c_read_internal(struct i2c_client *client,
 		u8 reg, u8 *data, u16 len)
@@ -49,6 +148,9 @@ static s32 bhy_i2c_read_internal(struct i2c_client *client,
 		},
 	};
 
+	if (bhy_i2c_cooldown_active())
+		return -EIO;
+
 	for (retry = 0; retry < BHY_MAX_RETRY_I2C_XFER; retry++) {
 		ret = i2c_transfer(client->adapter, msg, ARRAY_SIZE(msg));
 		if (ret >= 0)
@@ -57,6 +159,7 @@ static s32 bhy_i2c_read_internal(struct i2c_client *client,
 				BHY_I2C_WRITE_DELAY_TIME);
 	}
 
+	bhy_i2c_note_result(ret);
 	return ret;
 	/*int ret;
 	if ((ret = i2c_master_send(client, &reg, 1)) < 0)
@@ -82,6 +185,9 @@ static s32 bhy_i2c_write_internal(struct i2c_client *client,
 	msg.len = len + 1;
 	msg.buf = buf;
 
+	if (bhy_i2c_cooldown_active())
+		return -EIO;
+
 	for (retry = 0; retry < BHY_MAX_RETRY_I2C_XFER; retry++) {
 		ret = i2c_transfer(client->adapter, &msg, 1);
 		if (ret >= 0)
@@ -90,6 +196,7 @@ static s32 bhy_i2c_write_internal(struct i2c_client *client,
 				BHY_I2C_WRITE_DELAY_TIME);
 	}
 
+	bhy_i2c_note_result(ret);
 	return ret;
 }
 

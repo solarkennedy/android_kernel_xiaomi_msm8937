@@ -533,6 +533,21 @@ static int bhy_load_ram_patch(struct bhy_client_data *client_data)
 	__pm_stay_awake(client_data->patch_wlock);
 	mutex_lock(&client_data->mutex_bus_op);
 
+	/*
+	 * Now that we hold mutex_bus_op, drop the bhy_i2c.c bus circuit
+	 * breaker. When reset() sends us here to recover a wedged hub the
+	 * breaker is armed and would fail-fast (-EIO) every op below --
+	 * including the BHY_REG_RESET_REQ write that soft-resets the MCU --
+	 * so the reload would silently accomplish nothing. Clearing it under
+	 * the lock (rather than in the caller) is what makes recovery
+	 * reliable: no other bus user -- notably the level-high FIFO IRQ,
+	 * which spins on failed reads during a wedge -- can re-arm it between
+	 * here and the reset write. Whatever the breaker learned describes the
+	 * hub we are about to tear down; if the reload genuinely can't get
+	 * through, the first failed op re-arms it.
+	 */
+	bhy_i2c_clear_degraded();
+
 	atomic_set(&client_data->ram_patch_loaded, RAM_PATCH_READY);
 	PINFO("Check : ram_patch_loaded = %d ",
 		atomic_read(&client_data->ram_patch_loaded));
@@ -1181,6 +1196,21 @@ static void reset(struct bhy_client_data *client_data)
 		client_data->irq_force_disabled);
 
 	__pm_stay_awake(client_data->reset_wlock);
+
+	/*
+	 * The bhy_i2c.c bus circuit breaker is almost certainly armed here --
+	 * that is what tripped the recovery -- but it is cleared inside
+	 * bhy_load_ram_patch() under mutex_bus_op, not here. Dropping it
+	 * before that lock is held would let a concurrent bus user re-arm it
+	 * before the RESET_REQ write gets out (the level-high FIFO IRQ keeps
+	 * firing and reading throughout a hub wedge), silently no-op'ing the
+	 * reset. Every route through reset() ends in bhy_load_ram_patch(), so
+	 * clearing it there covers both paths below.
+	 *
+	 * On pepito bhy@28 has no "bhy,ldo_enable" property, so ldo_enable_pin
+	 * is negative and we always jump straight to direct_ram_patch -- the
+	 * power-cycle branch below is dead code on this device.
+	 */
 	if (client_data->ldo_enable_pin < 0) {
 		PINFO("no ldo_enable_pin");
 		goto direct_ram_patch;
@@ -1315,8 +1345,32 @@ static int check_watchdog_reset(struct bhy_client_data *client_data)
 
 	mutex_unlock(&client_data->mutex_bus_op);
 	if (ret < 0) {
-		PINFO("Read chip status failed. (%d)", ret);
-		return 0; /* Ignore reg_read fail. */
+		/*
+		 * A failed status read used to be reported as "healthy"
+		 * (return 0, "Ignore reg_read fail"), which inverted the
+		 * only recovery trigger that survives a screen-off wedge:
+		 * Reset#0 needs int_debug(), which bhy_read_fifo_data()
+		 * never calls on its i2c-error paths, and Reset#1/#2 are
+		 * both gated behind acc_enabled. So when the hub stopped
+		 * answering with the screen off, this monitor woke every
+		 * 10s, failed this read, declared the hub fine, and did
+		 * nothing -- observed 2026-07-16 doing exactly that ~30
+		 * times in a row while the sensors stayed dead until a
+		 * reboot ([E]3BHY "Read bytes remain reg failed" spinning
+		 * on a level-high IRQ that can never be de-asserted,
+		 * because only draining the FIFO clears it).
+		 *
+		 * Not being able to read the status register is not
+		 * evidence of health -- it is the strongest evidence we
+		 * have of the opposite. This is not a transient blip
+		 * either: bhy_read_reg() only fails here after
+		 * BHY_MAX_RETRY_I2C_XFER full retries, or while the
+		 * bhy_i2c.c breaker is in cooldown -- and that cooldown
+		 * itself only arms after a whole retry loop has failed.
+		 */
+		PINFO("Read chip status failed (%d) -- treating as malfunction",
+			ret);
+		return 1;
 	}
 
 	if (reg_data & BHY_CHIP_STATUS_BIT_FIRMWARE_IDLE) {
@@ -2021,6 +2075,13 @@ static void bhy_read_fifo_data(struct bhy_client_data *client_data)
 			(u8 *)&bytes_remain, 2) < 0) {
 		mutex_unlock(&client_data->mutex_bus_op);
 		PERR("Read bytes remain reg failed");
+		/* i2c FIFO read failed: this is a level-high ONESHOT IRQ, so returning
+		 * here without quiescing it re-fires forever (~27us) and monopolises
+		 * mutex_bus_op, starving the mcu_monitor_thread recovery. Route through
+		 * int_debug() -- same as the zero-length path -- to disable_irq_nosync +
+		 * set irq_force_disabled so Reset#0 -> reset() can actually reload the FW. */
+		int_debug(client_data, "Read bytes remain reg failed",
+			__func__, __LINE__);
 		return;
 	}
 #ifdef BHY_DEBUG
@@ -2046,6 +2107,13 @@ static void bhy_read_fifo_data(struct bhy_client_data *client_data)
 	if (ret < 0) {
 		mutex_unlock(&client_data->mutex_bus_op);
 		PERR("Read fifo data failed");
+		/* i2c FIFO read failed: this is a level-high ONESHOT IRQ, so returning
+		 * here without quiescing it re-fires forever (~27us) and monopolises
+		 * mutex_bus_op, starving the mcu_monitor_thread recovery. Route through
+		 * int_debug() -- same as the zero-length path -- to disable_irq_nosync +
+		 * set irq_force_disabled so Reset#0 -> reset() can actually reload the FW. */
+		int_debug(client_data, "Read fifo data failed",
+			__func__, __LINE__);
 		return;
 	}
 	mutex_unlock(&client_data->mutex_bus_op);
