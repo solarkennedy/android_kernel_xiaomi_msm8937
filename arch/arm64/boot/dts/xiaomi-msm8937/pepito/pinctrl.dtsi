@@ -32,6 +32,30 @@
 };
 
 &tlmm {
+	/*
+	 * WUSB3801 Type-C controller INT (gpio97) + chip-enable (gpio131).
+	 * common/delete-unused-peripherals.dtsi drops the base
+	 * msm8937-pinctrl node on the assumption no device drives this
+	 * chip; pepito does (see wusb3801@60 on &i2c_2), so restore it
+	 * here -- this file is included after common.dtsi, and keeping the
+	 * fix pepito-local avoids touching the 9 other devices sharing the
+	 * delete list. Values match the stock DTB's usbc_int_default
+	 * bit-for-bit; the pull-up is what makes both pins' active-low
+	 * signalling work.
+	 */
+	usbc_int_default: usbc_int_default {
+		mux {
+			pins = "gpio97", "gpio131";
+			function = "gpio";
+		};
+
+		config {
+			pins = "gpio97", "gpio131";
+			drive-strength = <2>;
+			bias-pull-up;
+		};
+	};
+
 	/* Volume up key pinctrl */
 	key_vol_up_default: key_vol_up_default {
 		mux {

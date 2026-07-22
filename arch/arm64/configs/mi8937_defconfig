@@ -3642,6 +3642,7 @@ CONFIG_TYPEC=y
 # CONFIG_TYPEC_TCPM is not set
 # CONFIG_TYPEC_UCSI is not set
 # CONFIG_TYPEC_TPS6598X is not set
+CONFIG_TYPEC_WUSB3801=y
 
 #
 # USB Type-C Multiplexer/DeMultiplexer Switch support

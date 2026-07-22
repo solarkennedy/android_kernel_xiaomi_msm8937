@@ -81,8 +81,46 @@
  * thread live).  The zero-child i2c-msm-v2 probe hang is avoided by
  * having the bhy@28 child.
  *
- * NOTE: wusb3801x@60 node not added yet — the 4.19 wusb3801 driver
- * state is unverified (track separately).
+ * wusb3801@60 (2026-07-16): pepito's stock HW has a Willsemi Type-C
+ * CC/orientation controller here, left unmanaged for the whole bring-up.
+ *
+ * This node was originally added on the theory that leaving it unmanaged
+ * caused a ~143s system-wide ANR (I2C contention during Android Auto USB
+ * negotiation starving the sensors HAL's binder pool via bhy). That theory
+ * was FALSIFIED the same day it was flashed: in a full reproduction every
+ * i2c timeout was at bhy's 0x28 and none at 0x60, and this chip's reads
+ * succeeded throughout the storm -- the bus was never wedged, the bhy hub
+ * was (see PLAN-sensors.md). Android Auto also cannot work on this build
+ * regardless: persist.vendor.usb.config is pinned adb-only, so the gadget
+ * never enters accessory mode. Managing the port is still correct on its
+ * own merits -- it is simply not the ANR fix.
+ *
+ * No QCOM downstream driver source for "qcom,wusb3801x" (the stock
+ * compatible) was findable anywhere -- same GPL gap bhy hit -- so this
+ * ports the mainline willsemi,wusb3801 driver instead
+ * (drivers/usb/typec/wusb3801.c has the full API-compatibility/porting
+ * notes). Property values below are decoded from the real stock DTB's
+ * wusb3801,init-mode=0x24 (-> DRP + try-sink), host-current=0x01 (->
+ * 1.5A), matched bit-for-bit against the ported driver's CTRL0 register
+ * layout.
+ *
+ * Interrupt and enable-GPIO flags are decoded from stock rather than
+ * guessed (an earlier revision copied bhy@28's edge-rising/active-high
+ * style and got both wrong):
+ *  - stock "interrupts = <0x61 0x2008>": 0x61 = 97, and 0x2008 is an
+ *    IRQF_* encoding (IRQF_ONESHOT | IRQF_TRIGGER_LOW), of which only
+ *    0x8 survives the irq domain's IRQ_TYPE_SENSE_MASK -> LEVEL_LOW.
+ *    Level (not edge) also matters here because the chip holds INT
+ *    asserted until REG_INT is read, so a missed edge would wedge the
+ *    IRQ permanently.
+ *  - stock "wusb3801,enb-gpio = <0xa7 0x83 0x01>": 0xa7 = tlmm,
+ *    0x83 = 131, and the 0x01 flag cell is OF_GPIO_ACTIVE_LOW -- so
+ *    the enable is active-low, and driving it high (as active-high
+ *    flags did) held the chip disabled and NACKed every access.
+ * Both corroborated by usbc_int_default biasing gpio97+gpio131 pull-up.
+ *
+ * drp-toggle-time (0x28 in stock) has no equivalent in the ported
+ * driver and is dropped; chip power-on default applies.
  */
 &i2c_2 {
 	status = "okay";
@@ -96,6 +134,25 @@
 		bhy,vdd_i2c-supply = <&pm8937_l5>;
 		bhy,vdd_1p8-supply = <&pm8937_l6>;
 		bhy,vdd_2p85-supply = <&pm8937_l10>;
+	};
+
+	wusb3801@60 {
+		compatible = "willsemi,wusb3801";
+		reg = <0x60>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <97 0x8>;		/* IRQ_TYPE_LEVEL_LOW */
+		enable-gpios = <&tlmm 131 1>;	/* GPIO_ACTIVE_LOW */
+		vbus-supply = <&smbcharger_charger_otg>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&usbc_int_default>;
+
+		connector {
+			compatible = "usb-c-connector";
+			power-role = "dual";
+			data-role = "dual";
+			try-power-role = "sink";
+			typec-power-opmode = "1.5A";
+		};
 	};
 };
 
