@@ -89,7 +89,15 @@ static int pcm_sample_format;
 module_param(pcm_sample_format, int, S_IRUGO);
 MODULE_PARM_DESC(pcm_sample_format, "PCM sample format: 0=S16_LE, 1=S24_LE, 2=S32_LE\n");
 
-static int pcm_no_constraint;
+/*
+ * Default ON for the QUAT_MI2S_RX DPCM backend binding: the BE substream
+ * shares the FE's runtime, so the container-profile rate constraint (48 kHz
+ * only in Palm's tfa9896.cnt) lands on whichever FE opens the BE. The voice
+ * FE (VoiceMMode1, 8 kHz) then fails hw_refine with a silent -EINVAL and the
+ * call has no audio. The BE rate is pinned to 48 kHz by be_hw_params_fixup
+ * regardless; the ADSP resamples FE streams, so the constraint adds nothing.
+ */
+static int pcm_no_constraint = 1;
 module_param(pcm_no_constraint, int, S_IRUGO);
 MODULE_PARM_DESC(pcm_no_constraint, "do not use constraints for PCM parameters\n");
 
