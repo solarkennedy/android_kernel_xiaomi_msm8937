@@ -234,6 +234,10 @@ struct bhy_client_data {
 	bool ar_enabled;
 	bool step_det_enabled;
 	bool step_cnt_enabled;
+	/* Last requested rates, so sync_sensor() can restore the native step
+	 * sensors at their original rate after a hub reset (std_step_handles). */
+	unsigned short step_det_delay;
+	unsigned short step_cnt_delay;
 	bool tilt_enabled;
 	bool pickup_enabled;
 	bool smd_enabled;
