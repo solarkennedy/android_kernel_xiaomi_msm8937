@@ -52,6 +52,40 @@ static s64 g_ts[4]; /* For fw load time test */
 #define ACC_EVENT_TIMEOUT	15000000000ULL
 #define RESET_TIMEOUT		1800000000000ULL  /* 30 min */
 
+/*
+ * Step detector / step counter source selection (pepito, 2026-07-23).
+ *
+ * This driver is Samsung-derived and never uses the hub's *native* step
+ * sensors. Instead it enables a custom pedometer slot
+ * (PEDOMETER_SENSOR = BHY_SENSOR_HANDLE_CUSTOM_3_WU, 60), parses its rich
+ * frame, and synthesizes handle 18/19 frames in generate_step_data(); the
+ * main FIFO parser correspondingly *drops* any native 18/19 frame so the two
+ * sources cannot duplicate.
+ *
+ * Palm's BHI160B firmware rejects that custom slot -- bhy_write_parameter()
+ * gets ack == 0x80 ("Param is not accepted") -- so enable_pedometer() fails,
+ * bhy_store_sensor_conf() returns early before setting step_*_enabled, and the
+ * step counter is pinned at 0 forever. Evidence that the standard handles are
+ * fine on this firmware: the conf write for sensor_sel 19 completes and logs
+ * "sensor: 19, enable: N" *before* the nested custom-slot write is refused.
+ *
+ * std_step_handles = 1 takes the native path instead: skip the pedometer
+ * indirection entirely and let the hub's own 18/19 frames through.
+ *
+ * VALIDATED on pepito 2026-07-23: with this enabled the step counter tracks a
+ * real walk (0 -> 30, monotonic, stops when walking stops) and the
+ * "Param is not accepted" rejection is gone. Defaults to 1 for that reason;
+ * kept as a runtime toggle as an escape hatch and so the legacy path stays
+ * testable. Re-subscribe (or restart the sensors HAL) after changing it,
+ * since it is sampled at enable time.
+ *   0 = legacy custom-pedometer path (broken on this firmware)
+ *   1 = native standard STEP_DETECTOR(18)/STEP_COUNTER(19)  [default]
+ */
+static int std_step_handles = 1;
+module_param(std_step_handles, int, 0644);
+MODULE_PARM_DESC(std_step_handles,
+	"1 = use the hub's native step detector/counter instead of the custom pedometer slot");
+
 static int axis_matrix[8][9] = {
 	{ 1, 0, 0, 0, 1, 0, 0, 0, 1, }, /* X Y Z */
 	{ 0, 1, 0, -1, 0, 0, 0, 0, 1, }, /* Y -X Z */
@@ -2135,8 +2169,12 @@ static void bhy_read_fifo_data(struct bhy_client_data *client_data)
 #endif /*~ BHY_AR_HAL_SUPPORT */
 		data_len = client_data->sensor_data_len[sensor_type];
 
-		if (sensor_type == BHY_SENSOR_HANDLE_STEP_DETECTOR
-			|| sensor_type == BHY_SENSOR_HANDLE_STEP_COUNTER)
+		/* Native 18/19 frames are dropped only when the synthesized
+		 * pedometer path owns these sensors, otherwise the two sources
+		 * would duplicate. With std_step_handles they ARE the source. */
+		if (!std_step_handles &&
+			(sensor_type == BHY_SENSOR_HANDLE_STEP_DETECTOR
+			|| sensor_type == BHY_SENSOR_HANDLE_STEP_COUNTER))
 			continue;
 
 		if (data_len < 0)
@@ -2657,18 +2695,35 @@ static ssize_t bhy_store_sensor_conf(struct device *dev
 			client_data->last_acc_check_time = get_current_timestamp();
 		}
 	} else if (client_data->sensor_sel == BHY_SENSOR_HANDLE_STEP_DETECTOR) {
-		ret = enable_pedometer(client_data, (bool)(buf[0] | buf[1]));
-		if (ret < 0)
-			return ret;
+		/* std_step_handles: the conf write above already armed the
+		 * hub's native detector; the custom pedometer slot (which this
+		 * firmware refuses) must not be touched. */
+		if (!std_step_handles) {
+			ret = enable_pedometer(client_data,
+					(bool)(buf[0] | buf[1]));
+			if (ret < 0)
+				return ret;
+		}
 
 		client_data->step_det_enabled = buf[0] | buf[1];
+		if (client_data->step_det_enabled)
+			client_data->step_det_delay = buf[1] << 8 | buf[0];
 	} else if (client_data->sensor_sel == BHY_SENSOR_HANDLE_STEP_COUNTER) {
-		ret = enable_pedometer(client_data, (bool)(buf[0] | buf[1]));
-		if (ret < 0)
-			return ret;
+		if (!std_step_handles) {
+			ret = enable_pedometer(client_data,
+					(bool)(buf[0] | buf[1]));
+			if (ret < 0)
+				return ret;
+		}
 
 		client_data->step_cnt_enabled = buf[0] | buf[1];
-		report_last_step_counter_data(client_data);
+		if (client_data->step_cnt_enabled)
+			client_data->step_cnt_delay = buf[1] << 8 | buf[0];
+		/* client_data->step_count is only ever fed by pedometer-frame
+		 * parsing, so in native mode it is a stale 0 -- replaying it
+		 * would inject a bogus counter event ahead of the hub's own. */
+		if (!std_step_handles)
+			report_last_step_counter_data(client_data);
 	} else if (client_data->sensor_sel == BHY_SENSOR_HANDLE_TILT_DETECTOR) {
 		client_data->tilt_enabled = buf[0] | buf[1];
 	} else if (client_data->sensor_sel
@@ -6691,10 +6746,17 @@ static int enable_pedometer(struct bhy_client_data *client_data, bool enable)
 	ret = enable_sensor(client_data, PEDOMETER_SENSOR,
 		enable, PEDOMETER_CYCLE);
 	if (ret < 0) {
-		if (enable)
+		if (enable) {
 			PERR("enable pedometer error");
-		else
+			/* Roll back: count was bumped *before* the hardware
+			 * attempt, so leaving it bumped makes every later
+			 * enable take the "(int)enable != count" early return
+			 * -- a fake success that never touches the hub, so the
+			 * pedometer can never be armed again this boot. */
+			count--;
+		} else {
 			PERR("disable pedometer error");
+		}
 	}
 
 	return ret;
@@ -6720,7 +6782,27 @@ static void sync_sensor(struct bhy_client_data *client_data)
 			PERR("re-enable acc sensor err");
 	}
 
-	if (client_data->pedo_enabled
+	if (std_step_handles) {
+		/* Native path: restore the hub's own step sensors at the rate
+		 * the HAL last asked for. Re-enabling PEDOMETER_SENSOR here
+		 * would just re-hit the param rejection after every reset. */
+		if (client_data->step_det_enabled) {
+			PINFO("re-enable native step detector");
+			ret = enable_sensor(client_data,
+				BHY_SENSOR_HANDLE_STEP_DETECTOR, 1,
+				client_data->step_det_delay);
+			if (ret < 0)
+				PERR("re-enable step detector error");
+		}
+		if (client_data->step_cnt_enabled) {
+			PINFO("re-enable native step counter");
+			ret = enable_sensor(client_data,
+				BHY_SENSOR_HANDLE_STEP_COUNTER, 1,
+				client_data->step_cnt_delay);
+			if (ret < 0)
+				PERR("re-enable step counter error");
+		}
+	} else if (client_data->pedo_enabled
 		|| client_data->step_det_enabled
 		|| client_data->step_cnt_enabled) {
 		PINFO("re-enable pedometer");
