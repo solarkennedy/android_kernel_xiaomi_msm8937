@@ -4601,6 +4601,101 @@ enhist_config_exit:
 	return ret;
 }
 
+/*
+ * Sunlight Readability Enhancement (SRE) — fixed "outdoor" tone curve
+ * programmed into the DSPP PA histogram (enhance) LUT, the same hardware
+ * block stock Palm's SVI (mm-pp-dpps) drove from userspace.  Gamma-0.50
+ * value-channel stretch: shadows/midtones lifted, hue untouched, white
+ * preserved.  Exposed via /sys/class/graphics/fb0/sre for the LiveDisplay
+ * sysfs SunlightEnhancement backend.
+ */
+static const u32 sre_enhist_lut[ENHIST_LUT_ENTRIES] = {
+	0, 64, 91, 111, 128, 143, 157, 169,
+	181, 192, 203, 212, 222, 231, 240, 248,
+	256, 264, 272, 279, 286, 294, 300, 307,
+	314, 320, 327, 333, 339, 345, 351, 357,
+	362, 368, 374, 379, 384, 390, 395, 400,
+	405, 410, 415, 420, 425, 430, 434, 439,
+	444, 448, 453, 457, 462, 466, 471, 475,
+	479, 484, 488, 492, 496, 500, 504, 508,
+	513, 516, 520, 524, 528, 532, 536, 540,
+	544, 547, 551, 555, 558, 562, 566, 569,
+	573, 577, 580, 584, 587, 591, 594, 598,
+	601, 604, 608, 611, 614, 618, 621, 624,
+	628, 631, 634, 637, 641, 644, 647, 650,
+	653, 656, 660, 663, 666, 669, 672, 675,
+	678, 681, 684, 687, 690, 693, 696, 699,
+	702, 705, 708, 710, 713, 716, 719, 722,
+	725, 728, 730, 733, 736, 739, 742, 744,
+	747, 750, 753, 755, 758, 761, 763, 766,
+	769, 771, 774, 777, 779, 782, 785, 787,
+	790, 792, 795, 798, 800, 803, 805, 808,
+	810, 813, 815, 818, 820, 823, 825, 828,
+	830, 833, 835, 838, 840, 843, 845, 847,
+	850, 852, 855, 857, 859, 862, 864, 867,
+	869, 871, 874, 876, 878, 881, 883, 885,
+	888, 890, 892, 895, 897, 899, 901, 904,
+	906, 908, 911, 913, 915, 917, 919, 922,
+	924, 926, 928, 931, 933, 935, 937, 939,
+	942, 944, 946, 948, 950, 952, 955, 957,
+	959, 961, 963, 965, 967, 969, 972, 974,
+	976, 978, 980, 982, 984, 986, 988, 990,
+	992, 995, 997, 999, 1001, 1003, 1005, 1007,
+	1009, 1011, 1013, 1015, 1017, 1019, 1021, 1023,
+};
+
+int mdss_mdp_enhist_sre_config(struct msm_fb_data_type *mfd, bool enable)
+{
+	struct mdss_pp_res_type_v1_7 *res_cache;
+	struct mdp_hist_lut_data_v1_7 *v17_data;
+	struct mdp_hist_lut_data *config;
+	u32 disp_num;
+	int ret;
+
+	if (!mfd)
+		return -EINVAL;
+
+	ret = pp_validate_dspp_mfd_block(mfd,
+			mfd->index + MDP_LOGICAL_BLOCK_DISP_0);
+	if (ret) {
+		pr_err("sre: invalid mfd index %d ret %d\n", mfd->index, ret);
+		return ret;
+	}
+
+	if (!mdss_pp_res || !mdss_pp_res->pp_data_v1_7) {
+		pr_err("sre: pp v1_7 data not initialized\n");
+		return -ENODEV;
+	}
+
+	mutex_lock(&mdss_pp_mutex);
+	disp_num = mfd->index;
+	res_cache = mdss_pp_res->pp_data_v1_7;
+	v17_data = &res_cache->hist_lut_v17_data[disp_num];
+
+	config = &mdss_pp_res->enhist_disp_cfg[disp_num];
+	memset(config, 0, sizeof(*config));
+	config->block = disp_num + MDP_LOGICAL_BLOCK_DISP_0;
+	config->version = mdp_hist_lut_v1_7;
+	config->hist_lut_first = 0;
+	config->cfg_payload = v17_data;
+
+	if (enable) {
+		memcpy(&res_cache->hist_lut[disp_num][0], sre_enhist_lut,
+				sizeof(sre_enhist_lut));
+		v17_data->len = ENHIST_LUT_ENTRIES;
+		v17_data->data = &res_cache->hist_lut[disp_num][0];
+		config->ops = MDP_PP_OPS_WRITE | MDP_PP_OPS_ENABLE;
+	} else {
+		config->ops = MDP_PP_OPS_DISABLE;
+	}
+
+	mdss_pp_res->pp_disp_flags[disp_num] |= PP_FLAGS_DIRTY_ENHIST;
+	mutex_unlock(&mdss_pp_mutex);
+
+	pr_info("sre: %s\n", enable ? "enabled" : "disabled");
+	return 0;
+}
+
 static int mdss_mdp_panel_default_dither_config(struct msm_fb_data_type *mfd,
 					u32 panel_bpp)
 {

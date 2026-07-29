@@ -1855,6 +1855,7 @@ int mdss_mdp_argc_config(struct msm_fb_data_type *mfd,
 			struct mdp_pgc_lut_data *config, u32 *copyback);
 int mdss_mdp_hist_lut_config(struct msm_fb_data_type *mfd,
 			struct mdp_hist_lut_data *config, u32 *copyback);
+int mdss_mdp_enhist_sre_config(struct msm_fb_data_type *mfd, bool enable);
 int mdss_mdp_pp_default_overlay_config(struct msm_fb_data_type *mfd,
 					struct mdss_panel_data *pdata);
 int mdss_mdp_dither_config(struct msm_fb_data_type *mfd,

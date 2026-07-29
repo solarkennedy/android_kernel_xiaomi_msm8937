@@ -1193,6 +1193,42 @@ static ssize_t hbm_store(struct device *dev,
 	return len;
 }
 
+/*
+ * Sunlight Readability Enhancement — LiveDisplay sysfs SunlightEnhancement
+ * backend.  Programs a fixed outdoor tone curve into the DSPP PA histogram
+ * LUT (mdss_mdp_enhist_sre_config), the block stock SVI used.
+ */
+static int mdss_fb_sre_enabled;
+
+static ssize_t sre_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", mdss_fb_sre_enabled);
+}
+
+static ssize_t sre_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct fb_info *fbi = dev_get_drvdata(dev);
+	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)fbi->par;
+	unsigned int enable;
+	int ret;
+
+	if (kstrtouint(buf, 0, &enable))
+		return -EINVAL;
+
+	if (mfd->index != 0)
+		return -EINVAL;
+
+	enable = !!enable;
+	ret = mdss_mdp_enhist_sre_config(mfd, enable);
+	if (ret)
+		return ret;
+
+	mdss_fb_sre_enabled = enable;
+	return len;
+}
+
 static DEVICE_ATTR_RO(msm_fb_type);
 static DEVICE_ATTR_RW(msm_fb_split);
 static DEVICE_ATTR_RO(show_blank_event);
@@ -1210,6 +1246,7 @@ static DEVICE_ATTR_RW(cabc);
 static DEVICE_ATTR_RW(color_enhance);
 static DEVICE_ATTR_RW(reading_mode);
 static DEVICE_ATTR_RW(hbm);
+static DEVICE_ATTR_RW(sre);
 
 static struct attribute *mdss_fb_attrs[] = {
 	&dev_attr_msm_fb_type.attr,
@@ -1229,6 +1266,7 @@ static struct attribute *mdss_fb_attrs[] = {
 	&dev_attr_color_enhance.attr,
 	&dev_attr_reading_mode.attr,
 	&dev_attr_hbm.attr,
+	&dev_attr_sre.attr,
 	NULL,
 };
 
