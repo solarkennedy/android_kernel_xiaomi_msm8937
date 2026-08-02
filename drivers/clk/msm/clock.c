@@ -1378,6 +1378,20 @@ static int tz_uart_handoff_pm_cb(struct notifier_block *nb,
 				 unsigned long event, void *unused)
 {
 	if (event == PM_SUSPEND_PREPARE && tz_uart_handoff_clk) {
+		/*
+		 * Serial-debug boot: keep the vote forever (original
+		 * bring-up behavior) so the shared BLSP1 UART stays
+		 * clocked for the console. Costs XO shutdown — debug
+		 * boots don't care about standby power.
+		 */
+		if (strstr(saved_command_line, "earlycon") ||
+		    strstr(saved_command_line, "console=ttyMSM") ||
+		    strstr(saved_command_line, "console=ttyHSL")) {
+			pr_info("%s: serial-debug boot, keeping %s handoff vote\n",
+				__func__, tz_uart_handoff_clk->dbg_name);
+			tz_uart_handoff_clk = NULL;
+			return NOTIFY_OK;
+		}
 		pr_info("%s: dropping deferred %s handoff vote\n", __func__,
 			tz_uart_handoff_clk->dbg_name);
 		clk_disable_unprepare(tz_uart_handoff_clk);

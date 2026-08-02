@@ -2955,13 +2955,24 @@ static int i2c_msm_probe(struct platform_device *pdev)
 	 * Drop the probe-time clock votes; transfers re-enable them on
 	 * demand. Leaving these held keeps the qup core clocks (parented
 	 * on XO) voted through system suspend, which blocks RPM XO
-	 * shutdown/VDD-min. Debug builds using earlycon lose console
-	 * output here when BLSP1 AHB gates with msm_serial not yet
-	 * probed — that only obscures earlycon, the kernel keeps running.
+	 * shutdown/VDD-min (~15 mA standby penalty).
+	 *
+	 * EXCEPT on serial-debug boots: with earlycon and msm_serial not
+	 * yet probed, dropping our vote gates BLSP1 AHB and silences the
+	 * early console at 0x78b0000 (the kernel keeps running — it just
+	 * looks hung). Detect that from the cmdline and keep the votes,
+	 * matching the original bring-up behavior.
 	 */
-	i2c_msm_pm_clk_disable(ctrl);
-	i2c_msm_pm_clk_unprepare(ctrl);
-	i2c_msm_clk_path_unvote(ctrl);
+	if (strstr(saved_command_line, "earlycon") ||
+	    strstr(saved_command_line, "console=ttyMSM") ||
+	    strstr(saved_command_line, "console=ttyHSL")) {
+		dev_info(ctrl->dev,
+			"serial-debug boot: holding probe clock votes for the console (blocks XO shutdown)\n");
+	} else {
+		i2c_msm_pm_clk_disable(ctrl);
+		i2c_msm_pm_clk_unprepare(ctrl);
+		i2c_msm_clk_path_unvote(ctrl);
+	}
 
 	ret = i2c_msm_rsrcs_gpio_pinctrl_init(ctrl);
 	if (ret)
