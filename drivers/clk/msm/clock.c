@@ -26,6 +26,7 @@
 #include <linux/of.h>
 #include <linux/clk/msm-clk-provider.h>
 #include <linux/of_platform.h>
+#include <linux/suspend.h>
 #include <linux/pm_opp.h>
 
 #include <trace/events/power.h>
@@ -1366,6 +1367,29 @@ int __init msm_clock_init(struct clock_init_data *data)
 	return 0;
 }
 
+/*
+ * Deferred drop of the bootloader's gcc_blsp1_uart2_apps_clk handoff vote
+ * (Palm pepito TZ debug console — see the comment in clock_late_init).
+ * Dropped once, on the first suspend attempt, when TZ is certainly idle.
+ */
+static struct clk *tz_uart_handoff_clk;
+
+static int tz_uart_handoff_pm_cb(struct notifier_block *nb,
+				 unsigned long event, void *unused)
+{
+	if (event == PM_SUSPEND_PREPARE && tz_uart_handoff_clk) {
+		pr_info("%s: dropping deferred %s handoff vote\n", __func__,
+			tz_uart_handoff_clk->dbg_name);
+		clk_disable_unprepare(tz_uart_handoff_clk);
+		tz_uart_handoff_clk = NULL;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block tz_uart_handoff_nb = {
+	.notifier_call = tz_uart_handoff_pm_cb,
+};
+
 static int __init clock_late_init(void)
 {
 	struct handoff_clk *h, *h_temp;
@@ -1388,16 +1412,20 @@ static int __init clock_late_init(void)
 	list_for_each_entry_safe(h, h_temp, &handoff_list, list) {
 		/*
 		 * Pepito (MSM8940 + stock Palm TZ 8.1): dropping
-		 * gcc_blsp1_uart2_apps_clk trips a TZ PS_HOLD assertion.
-		 * TZ keeps its own debug console on BLSP1 UART2 and fires
-		 * PS_HOLD when the kernel removes the clock from under it.
-		 * Confirmed via ramoops: every clock through usb_hs_system_clk_src
-		 * completes; this is the last line logged before the reset.
-		 * Leave the bootloader's vote in place — the UART driver will
-		 * re-vote when it probes.
+		 * gcc_blsp1_uart2_apps_clk HERE trips a TZ PS_HOLD
+		 * assertion — TZ keeps its debug console on BLSP1 UART2
+		 * and may still be printing this early in boot (confirmed
+		 * via ramoops: this was the last late_init line before the
+		 * reset). But holding the vote forever keeps the uart RCG →
+		 * gpll0 → XO chain alive through system suspend, blocking
+		 * RPM XO shutdown/VDD-min (~15 mA standby penalty). Stock
+		 * 3.18 drops this clock like any other and runs with it
+		 * off, so the off state itself is safe once TZ is quiet.
+		 * Defer the drop to first PM_SUSPEND_PREPARE instead.
 		 */
 		if (h->clk->dbg_name &&
 		    !strcmp(h->clk->dbg_name, "gcc_blsp1_uart2_apps_clk")) {
+			tz_uart_handoff_clk = h->clk;
 			list_del(&h->list);
 			kfree(h);
 			continue;
@@ -1406,6 +1434,9 @@ static int __init clock_late_init(void)
 		list_del(&h->list);
 		kfree(h);
 	}
+
+	if (tz_uart_handoff_clk)
+		register_pm_notifier(&tz_uart_handoff_nb);
 
 	list_for_each_entry_safe(v, v_temp, &handoff_vdd_list, list) {
 		unvote_vdd_level(v->vdd_class, v->vdd_class->num_levels - 1);
