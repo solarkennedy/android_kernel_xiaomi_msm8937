@@ -7316,6 +7316,9 @@ static int smb_parse_dt(struct smbchg_chip *chip)
 					"qcom,force-aicl-rerun");
 	chip->skip_usb_suspend_for_fake_battery = of_property_read_bool(node,
 				"qcom,skip-usb-suspend-for-fake-battery");
+	/* |=: smbchg_wa_config() also forces this on PMI8937/PMI8940 */
+	chip->hvdcp_not_supported |= of_property_read_bool(node,
+					"qcom,hvdcp-not-supported");
 
 	/* parse the battery missing detection pin source */
 	rc = of_property_read_string(chip->pdev->dev.of_node,

@@ -36,6 +36,14 @@
 	qcom,skip-usb-suspend-for-fake-battery;
 	qcom,jeita-temp-hard-limit = <1>;
 	qcom,override-usb-current;
+	/*
+	 * Palm is a 5V-only device: stock kernel force-disables HVDCP on
+	 * pepito (CONFIG_TCT_MSM8940_PEPITO in msm-3.18 smbchg_wa_config).
+	 * With HVDCP_EN left on, the PMI8950's QC 9V handshake collapses
+	 * VBUS on non-QC power banks -> endless ~4s connect/charge/
+	 * disconnect loop (usbin-uv right after hvdcp_det_work).
+	 */
+	qcom,hvdcp-not-supported;
 };
 
 &qpnp_fg {
