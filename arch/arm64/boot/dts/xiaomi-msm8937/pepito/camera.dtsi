@@ -25,9 +25,23 @@
  *
  *   - led_flash0 in vendor-legacy/qcom/pmi8950.dtsi is configured for
  *     dual-source (flash0+flash1, torch0+torch1, switch).  Pepito's
- *     PMI8950 wires only the single-source LEDs (matching the 4.9
- *     reference layout), so we override the source lists and drop the
- *     switch-source property.
+ *     PMI8950 wires only the single LED pair (matching the 4.9 reference
+ *     layout), so we narrow the flash and torch source lists to *_0.
+ *
+ *     The SWITCH source is deliberately kept.  Dropping it (as this file
+ *     did until 2026-08-01) is what desynced the capture flash: it is the
+ *     only source of msm_flash's switch_trigger, and for a PMIC-type flash
+ *     msm_flash_prepare() returns -EINVAL when switch_trigger is NULL --
+ *     which msm_flash_config() propagates, so EVERY flash cfg ioctl
+ *     (INIT/LOW/HIGH/OFF/RELEASE) reports failure to the mm-camera daemon
+ *     *after* its LED side effects have already run.  The LED still
+ *     lights, but the daemon cannot sequence it against the exposure, and
+ *     msm_flash_query_current() leaves max_avail_curr at -EINVAL so AEC
+ *     cannot size the pulse either.  Stock Palm 8.1 keeps switch-source on
+ *     its qcom,camera-flash node (dts-3.19-pepito/pepito.dts:11269), and so
+ *     does santoni, the other single-source PMI8950 variant in this tree.
+ *     Our pmi8950_switch node is already identical to stock's qcom,switch.
+ *     See PLAN-misc.md "Capture flash out of sync with the shutter".
  *
  *   - Clock references use the downstream MSM clock framework
  *     (&clock_gcc + lowercase clk_*) per CONFIG_USE_COMMON_CLK_MSM in
@@ -38,9 +52,42 @@
  */
 
 &led_flash0 {
-	/delete-property/ qcom,switch-source;
+	/* Single LED pair; qcom,switch-source is inherited from pmi8950.dtsi
+	 * on purpose -- see the note above before deleting it again. */
 	qcom,flash-source = <&pmi8950_flash0>;
 	qcom,torch-source = <&pmi8950_torch0>;
+};
+
+/*
+ * Flash operating current.  pmi8950.dtsi defaults flash_0 to 625 mA, which is
+ * the upstream *dual*-LED split (625 + 625 across flash_0 + flash_1).  Pepito
+ * has one LED and stock drives it at the full 1000 mA
+ * (dts-3.19-pepito/pepito.dts:8544).  This is the fallback flash_op_current
+ * msm_flash clamps to when the daemon's requested current is out of range --
+ * which is the path that was in use while msm_flash_query_current() was
+ * returning -EINVAL (see the switch-source note below).  max-current is
+ * already 1000 in both trees; only the operating value differed.
+ */
+&pmi8950_flash0 {
+	qcom,current = <1000>;
+};
+
+/*
+ * Flash-LED hardware enable line.  Stock wires the PMI flash block's
+ * pinctrl to TLMM gpio33 (dts-3.19-pepito/pepito.dts:8532, phandles
+ * 0x10b/0x10c = rear_flash_led_enable/_disable) and sets
+ * qcom,follow-otst2-rb-disabled; our tree defines those pinctrl states
+ * (inherited from msm8937-pinctrl.dtsi) but nothing referenced them, so
+ * leds-qpnp-flash.c saw led->pinctrl == NULL and never selected the
+ * active state -- gpio33 stayed wherever the bootloader left it.
+ * Same property set as the QCT reference wiring in
+ * vendor-legacy/qcom/msm8917-cdp-mirror-lake-touch.dtsi.
+ */
+&flash_led {
+	pinctrl-names = "flash_led_enable", "flash_led_disable";
+	pinctrl-0 = <&rear_flash_led_enable>;
+	pinctrl-1 = <&rear_flash_led_disable>;
+	qcom,follow-otst2-rb-disabled;
 };
 
 &tlmm {
