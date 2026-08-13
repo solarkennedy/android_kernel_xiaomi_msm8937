@@ -7,6 +7,8 @@
 #include <linux/kmemleak.h>
 #include <linux/delay.h>
 #include <linux/sched/signal.h>
+#include <linux/moduleparam.h>
+#include <linux/of.h>
 #include "diagchar.h"
 #include "diagfwd.h"
 #include "diagfwd_cntl.h"
@@ -20,6 +22,31 @@
 
 #define FEATURE_SUPPORTED(x)	((feature_mask << (i * 8)) & (1 << x))
 #define DIAG_GET_MD_DEVICE_SIG_MASK(proc) (0x100000 * (1 << proc))
+
+/*
+ * Socket diag on this kernel is QRTR-only (diagfwd_socket.c), but a modem
+ * running on the legacy msm_ipc_router transport is not a QRTR node: if it
+ * advertises F_DIAG_SOCKETS_ENABLED, diagfwd_close_transport() tears down the
+ * working SMD/rpmsg diag channels and parks the modem on a socket backend
+ * that can never connect.  This switch keeps the modem on rpmsg instead, in
+ * both directions of the feature-mask exchange.
+ *
+ * modem_socket_diag = 1: honor the modem's socket feature (QRTR modems, the
+ * historical default); 0: force modem diag onto SMD/rpmsg; -1 (default):
+ * auto — forced to rpmsg on machines compatible "xiaomi,pepito", whose modem
+ * lives on ipc_router (see ipc_router_rpmsg_xprt.c and PLAN-qmux.md).
+ */
+static int modem_socket_diag = -1;
+module_param(modem_socket_diag, int, 0644);
+MODULE_PARM_DESC(modem_socket_diag,
+	"Modem diag over sockets: 1=allow, 0=force rpmsg, -1=auto (rpmsg on xiaomi,pepito)");
+
+int diag_modem_socket_diag_enabled(void)
+{
+	if (modem_socket_diag >= 0)
+		return modem_socket_diag != 0;
+	return !of_machine_is_compatible("xiaomi,pepito");
+}
 /* tracks which peripheral is undergoing SSR */
 static uint16_t reg_dirty[NUM_PERIPHERALS];
 static uint8_t diag_id = DIAG_ID_APPS;
@@ -196,7 +223,9 @@ static void enable_socket_feature(uint8_t peripheral)
 	if (peripheral >= NUM_PERIPHERALS)
 		return;
 
-	if (driver->supports_sockets)
+	if (driver->supports_sockets &&
+	    (peripheral != PERIPHERAL_MODEM ||
+	     diag_modem_socket_diag_enabled()))
 		driver->feature[peripheral].sockets_enabled = 1;
 	else
 		driver->feature[peripheral].sockets_enabled = 0;
