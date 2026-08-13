@@ -389,6 +389,7 @@ struct diag_ctrl_passthru {
 } __packed;
 
 int diagfwd_cntl_init(void);
+int diag_modem_socket_diag_enabled(void);
 int diag_add_diag_id_to_list(uint8_t diag_id,
 	char *process_name, uint8_t pd_val, uint8_t peripheral);
 void diagfwd_cntl_channel_init(void);

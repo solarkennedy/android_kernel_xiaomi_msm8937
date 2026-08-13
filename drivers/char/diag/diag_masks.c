@@ -749,7 +749,9 @@ static void diag_send_feature_mask_update(uint8_t peripheral)
 		if (driver->feature[peripheral].diagid_v2_feature_mask)
 			DIAG_SET_FEATURE_MASK(F_DIAGID_FEATURE_MASK);
 	DIAG_SET_FEATURE_MASK(F_DIAG_MASK_CENTRALIZATION);
-	if (driver->supports_sockets)
+	if (driver->supports_sockets &&
+	    (peripheral != PERIPHERAL_MODEM ||
+	     diag_modem_socket_diag_enabled()))
 		DIAG_SET_FEATURE_MASK(F_DIAG_SOCKETS_ENABLED);
 	DIAG_SET_FEATURE_MASK(F_DIAG_MULTI_SIM_SUPPORT);
 
