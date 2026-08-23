@@ -4826,6 +4826,32 @@ static int fg_power_set_property(struct power_supply *psy,
 			rc = -EINVAL;
 		}
 		break;
+	case POWER_SUPPLY_PROP_CYCLE_COUNTS:
+		/*
+		 * Post-battery-swap reset (driven by the "Reset wear data"
+		 * button in the Battery wear profile screen): zero all
+		 * per-SoC-bucket cycle counters in FG SRAM and restore the
+		 * learned capacity to the profile nominal so state-of-health
+		 * restarts at 100% and re-learns on the new pack. Only 0 is
+		 * accepted — the histogram itself is not settable.
+		 */
+		if (val->intval != 0) {
+			rc = -EINVAL;
+			break;
+		}
+		mutex_lock(&chip->cyc_ctr.lock);
+		clear_cycle_counter(chip);
+		mutex_unlock(&chip->cyc_ctr.lock);
+		if (chip->nom_cap_uah > 0) {
+			mutex_lock(&chip->learning_data.learning_lock);
+			chip->learning_data.learned_cc_uah = chip->nom_cap_uah;
+			fg_cap_learning_save_data(chip);
+			mutex_unlock(&chip->learning_data.learning_lock);
+		}
+		pr_info("battery wear history reset from sysfs\n");
+		if (chip->power_supply_registered)
+			power_supply_changed(chip->bms_psy);
+		break;
 	case POWER_SUPPLY_PROP_SAFETY_TIMER_EXPIRED:
 		chip->safety_timer_expired = val->intval;
 		schedule_work(&chip->status_change_work);
@@ -4856,6 +4882,7 @@ static int fg_property_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_COOL_TEMP:
 	case POWER_SUPPLY_PROP_WARM_TEMP:
 	case POWER_SUPPLY_PROP_CYCLE_COUNT_ID:
+	case POWER_SUPPLY_PROP_CYCLE_COUNTS:
 	case POWER_SUPPLY_PROP_BATTERY_INFO:
 	case POWER_SUPPLY_PROP_BATTERY_INFO_ID:
 		return 1;
