@@ -70,8 +70,44 @@
 #define BHY_C1_PRODUCT_ID	0x81
 #define BST_FPGA_PRODUCT_ID_7183	0x83
 #define BHY_RESET_WAIT_RETRY	1000
-#define BHY_DEF_RAM_PATCH_FILE_PATH	"/system/vendor/firmware/ram_patch.fw"
+/* RAM patch is fetched through request_firmware() from /vendor/firmware by
+ * BOTH loaders (bhy_store_req_fw at boot and bhy_load_ram_patch on recovery).
+ * The recovery loader used to filp_open() a hard-coded
+ * "/system/vendor/firmware/ram_patch.fw" that does not exist on pepito, so
+ * every reset() reset the hub into ROM and then failed the upload -- the
+ * hub was left dead with no firmware (observed live 2026-09-09). */
+#define BHY_RAM_PATCH_FW_NAME	"bhi160b_ram_patch.fw"
 #define BHY_FIFO_LEN_MAX	(30 * 1024)
+/*
+ * Largest single I2C read used to drain the host FIFO.
+ *
+ * Two constraints, both measured on pepito 2026-09-09 (i2ctransfer on
+ * /dev/i2c-2 against the live hub):
+ *
+ *  1. i2c-msm-v2 on this bus runs with qcom,disable-dma (Xiaomi common
+ *     soc.dtsi), so any transfer larger than its input FIFO goes through
+ *     BLOCK mode -- and BLOCK-mode reads of more than one 256-byte buffer
+ *     never complete: 256 bytes OK, 257 bytes -> TIMEOUT_ERROR with SCL held
+ *     low, for ANY slave on the bus (wusb3801 at 0x60 fails identically;
+ *     i2c-6, which has DMA enabled, reads 3000 bytes fine). A FIFO drain
+ *     after suspend (up to 8254 bytes, the hub's whole non-wakeup FIFO) was
+ *     therefore the only transfer on this bus that could never succeed; the
+ *     "hub wedge after suspend/resume" was this controller limitation, not
+ *     the hub.
+ *  2. The hub exposes its FIFO through a 50-byte register window
+ *     (0x00..0x31). A read that starts by writing address 0x00 resumes from
+ *     the base of the CURRENT window, so a chunk that is not a multiple of
+ *     50 makes the next addressed chunk re-send (len mod 50) stale bytes
+ *     (256-byte chunks: 6 duplicated bytes at every boundary). Chunks of
+ *     250 = 5 * 50 were verified seamless: zero overlap, frame stream
+ *     parses cleanly with 20 ms timestamp steps across the boundaries.
+ *
+ * 250 <= 256 keeps every FIFO read in the controller's FIFO mode (the
+ * per-transfer timeout drops from 2.36 s for 8254 bytes to ~0.56 s) and
+ * satisfies the window rule. Costs ~35 transactions instead of one for a
+ * full FIFO (~2 ms extra bus time).
+ */
+#define BHY_FIFO_READ_CHUNK	250
 #define BHY_FIFO_READ_LEN	50	/* must be multiple of 50 */
 #define BHY_PARAM_ACK_WAIT_RETRY	100
 
