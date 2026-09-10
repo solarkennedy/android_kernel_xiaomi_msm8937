@@ -128,6 +128,26 @@ void bhy_i2c_clear_degraded(void)
 }
 EXPORT_SYMBOL(bhy_i2c_clear_degraded);
 
+/*
+ * The retry loops below exist for transient NACK/arbitration glitches, which
+ * fail in microseconds. A failure that took hundreds of milliseconds is the
+ * controller's own transfer timeout (bus held, slave not answering) and
+ * repeating it BHY_MAX_RETRY_I2C_XFER times only multiplies the stall while
+ * mutex_bus_op is held: measured 2026-09-09, one 8254-byte FIFO read that
+ * timed out at 2.36 s was retried 10x back to back = 24.8 s during which
+ * every sensors-HAL call blocked, WindowManager sat in
+ * WindowOrientationListener.enable() holding its lock, and touch input was
+ * frozen for 23 s ("PointerEventDispatcher0 spent 23053ms"). Give up after
+ * the first slow failure instead; the breaker and the recovery path take it
+ * from there.
+ */
+#define BHY_I2C_SLOW_FAIL_MS		100
+
+static bool bhy_i2c_failed_slowly(unsigned long t0)
+{
+	return time_after(jiffies, t0 + msecs_to_jiffies(BHY_I2C_SLOW_FAIL_MS));
+}
+
 static s32 bhy_i2c_read_internal(struct i2c_client *client,
 		u8 reg, u8 *data, u16 len)
 {
@@ -152,8 +172,12 @@ static s32 bhy_i2c_read_internal(struct i2c_client *client,
 		return -EIO;
 
 	for (retry = 0; retry < BHY_MAX_RETRY_I2C_XFER; retry++) {
+		unsigned long t0 = jiffies;
+
 		ret = i2c_transfer(client->adapter, msg, ARRAY_SIZE(msg));
 		if (ret >= 0)
+			break;
+		if (bhy_i2c_failed_slowly(t0))
 			break;
 		usleep_range(BHY_I2C_WRITE_DELAY_TIME,
 				BHY_I2C_WRITE_DELAY_TIME);
@@ -189,8 +213,12 @@ static s32 bhy_i2c_write_internal(struct i2c_client *client,
 		return -EIO;
 
 	for (retry = 0; retry < BHY_MAX_RETRY_I2C_XFER; retry++) {
+		unsigned long t0 = jiffies;
+
 		ret = i2c_transfer(client->adapter, &msg, 1);
 		if (ret >= 0)
+			break;
+		if (bhy_i2c_failed_slowly(t0))
 			break;
 		usleep_range(BHY_I2C_WRITE_DELAY_TIME,
 				BHY_I2C_WRITE_DELAY_TIME);

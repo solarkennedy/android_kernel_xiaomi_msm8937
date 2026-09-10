@@ -100,25 +100,31 @@ static int axis_matrix[8][9] = {
 static int check_watchdog_reset(struct bhy_client_data *client_data);
 void report_last_step_counter_data(struct bhy_client_data *client_data);
 
+/*
+ * Quiesce the level-high ONESHOT FIFO IRQ and hand the hub to
+ * mcu_monitor_thread for a reset (Reset#0). The wake_up is what makes the
+ * recovery prompt -- the monitor otherwise only polls every 10 s.
+ */
+static void int_force_disable(struct bhy_client_data *client_data,
+	char *log, const char *func, int line)
+{
+	printk(KERN_INFO "[D]" KERN_DEBUG MODULE_TAG
+		"<%s><%d> %s -- disabling IRQ, requesting hub reset\n",
+		func, line, log);
+
+	disable_irq_nosync(client_data->data_bus.irq);
+	client_data->irq_force_disabled = true;
+	wake_up(&client_data->monitor_wq);
+}
+
+/* Counted variant for the noisy "zero length FIFO" path only. */
 static void int_debug(struct bhy_client_data *client_data,
 	char *log, const char *func, int line)
 {
 	static int count;
-	int ret;
 
 	if (count++ > INT_DEBUG_COUNT) {
-		printk(KERN_INFO "[D]" KERN_DEBUG MODULE_TAG
-			"<%s><%d> %s \n", func, line, log);
-
-		disable_irq_nosync(client_data->data_bus.irq);
-		client_data->irq_force_disabled = true;
-
-		ret = check_watchdog_reset(client_data);
-
-		/*
-		printk(KERN_INFO "[D]" KERN_DEBUG MODULE_TAG
-			"<%s><%d> irq_force_disabled \n", func, line);
-			*/
+		int_force_disable(client_data, log, func, line);
 		count = 0;
 	}
 }
@@ -150,6 +156,32 @@ static int bhy_write_reg(struct bhy_client_data *client_data,
 		return -EIO;
 	return client_data->data_bus.write(client_data->data_bus.dev,
 		reg, data, len);
+}
+
+/*
+ * Drain @len bytes of the host FIFO into @buf in transfers of at most
+ * BHY_FIFO_READ_CHUNK bytes, each addressed at BHY_REG_FIFO_BUFFER_0.
+ * See the BHY_FIFO_READ_CHUNK comment for why a single read of the whole
+ * FIFO (up to 8254 bytes after a suspend) can never complete on this bus
+ * and why 250 is the chunk size the hub's 50-byte window tolerates.
+ * Returns @len, or the first negative bus error.
+ */
+static int bhy_read_fifo_bytes(struct bhy_client_data *client_data,
+		u8 *buf, u16 len)
+{
+	u16 off = 0;
+	int ret;
+
+	while (off < len) {
+		u16 n = min_t(u16, len - off, BHY_FIFO_READ_CHUNK);
+
+		ret = bhy_read_reg(client_data, BHY_REG_FIFO_BUFFER_0,
+				buf + off, n);
+		if (ret < 0)
+			return ret;
+		off += n;
+	}
+	return len;
 }
 
 static int bhy_read_parameter(struct bhy_client_data *client_data,
@@ -551,11 +583,10 @@ static int bhy_load_ram_patch(struct bhy_client_data *client_data)
 	u32 u32_val;
 	int retry = BHY_RESET_WAIT_RETRY;
 	/* int reset_flag_copy; */
-	struct file *f;
-	mm_segment_t old_fs;
+	const struct firmware *fw;
 	struct ram_patch_header header;
-	loff_t pos;
-	ssize_t read_len;
+	size_t pos;
+	size_t read_len;
 	char data_buf[64]; /* Must be less than burst write max buf */
 	u16 remain;
 	int i;
@@ -666,74 +697,61 @@ static int bhy_load_ram_patch(struct bhy_client_data *client_data)
 		return -EIO;
 	}
 
-	/* Upload data */
-	f = filp_open(BHY_DEF_RAM_PATCH_FILE_PATH, O_RDONLY, 0);
-	if (f == NULL || IS_ERR(f)) {
+	/*
+	 * Upload data. Same firmware, same header format and same
+	 * request_firmware() source as the HAL-driven bhy_store_req_fw() path;
+	 * the previous filp_open() of a hard-coded /system path found nothing
+	 * on pepito, so every recovery reset left the hub in ROM with no
+	 * firmware (see BHY_RAM_PATCH_FW_NAME).
+	 */
+	ret = request_firmware(&fw, BHY_RAM_PATCH_FW_NAME,
+			client_data->data_bus.dev);
+	if (ret < 0) {
 		mutex_unlock(&client_data->mutex_bus_op);
-		PERR("open file [%s] error\n", BHY_DEF_RAM_PATCH_FILE_PATH);
+		PERR("request_firmware [%s] failed: %zd",
+			BHY_RAM_PATCH_FW_NAME, ret);
+		atomic_set(&client_data->reset_flag, RESET_FLAG_ERROR);
+		__pm_relax(client_data->patch_wlock);
+		return ret;
+	}
+	if (fw->size < sizeof(header)) {
+		mutex_unlock(&client_data->mutex_bus_op);
+		PERR("Firmware too short for header (%zu)", fw->size);
+		release_firmware(fw);
 		atomic_set(&client_data->reset_flag, RESET_FLAG_ERROR);
 		__pm_relax(client_data->patch_wlock);
 		return -EIO;
 	}
-	old_fs = get_fs();
-	set_fs(get_ds());
-	pos = 0;
-	read_len = vfs_read(f, (char *)&header, sizeof(header), &pos);
-	if (read_len < 0 || read_len != sizeof(header)) {
-		mutex_unlock(&client_data->mutex_bus_op);
-		PERR("Read file header failed");
-		set_fs(old_fs);
-		filp_close(f, NULL);
-		atomic_set(&client_data->reset_flag, RESET_FLAG_ERROR);
-		__pm_relax(client_data->patch_wlock);
-		return -EIO;
-	}
+	memcpy(&header, fw->data, sizeof(header));
+	pos = sizeof(header);
 	remain = header.data_length;
-	if (remain % 4 != 0) {
+	if (remain % 4 != 0 || pos + remain > fw->size) {
 		mutex_unlock(&client_data->mutex_bus_op);
-		PERR("data length cannot be divided by 4");
-		set_fs(old_fs);
-		filp_close(f, NULL);
+		PERR("Bad data length %u for firmware of %zu bytes",
+			remain, fw->size);
+		release_firmware(fw);
 		atomic_set(&client_data->reset_flag, RESET_FLAG_ERROR);
 		__pm_relax(client_data->patch_wlock);
 		return -EINVAL;
 	}
 	while (remain > 0) {
-		read_len = vfs_read(f, data_buf, sizeof(data_buf), &pos);
-		if (read_len < 0) {
-			mutex_unlock(&client_data->mutex_bus_op);
-			PERR("Read file data failed");
-			set_fs(old_fs);
-			filp_close(f, NULL);
-			atomic_set(&client_data->reset_flag, RESET_FLAG_ERROR);
-			__pm_relax(client_data->patch_wlock);
-			return -EIO;
-		}
-		if (read_len == 0) {
-			mutex_unlock(&client_data->mutex_bus_op);
-			PERR("File ended abruptly");
-			set_fs(old_fs);
-			filp_close(f, NULL);
-			atomic_set(&client_data->reset_flag, RESET_FLAG_ERROR);
-			__pm_relax(client_data->patch_wlock);
-			return -EINVAL;
-		}
+		read_len = min_t(size_t, remain, sizeof(data_buf));
+		memcpy(data_buf, fw->data + pos, read_len);
+		pos += read_len;
 		for (i = 0; i < read_len; i += 4)
 			*(u32 *)(data_buf + i) = swab32(*(u32 *)(data_buf + i));
 		if (bhy_write_reg(client_data, BHY_REG_UPLOAD_DATA,
 			(u8 *)data_buf, read_len) < 0) {
 			mutex_unlock(&client_data->mutex_bus_op);
 			PERR("Write ram patch data failed");
-			set_fs(old_fs);
-			filp_close(f, NULL);
+			release_firmware(fw);
 			atomic_set(&client_data->reset_flag, RESET_FLAG_ERROR);
 			__pm_relax(client_data->patch_wlock);
 			return -EIO;
 		}
 		remain -= read_len;
 	}
-	set_fs(old_fs);
-	filp_close(f, NULL);
+	release_firmware(fw);
 
 	/* Check CRC */
 	if (bhy_read_reg(client_data, BHY_REG_DATA_CRC_0,
@@ -1467,19 +1485,23 @@ static int mcu_monitor_thread(void *arg)
 
 		if (client_data->acc_enabled) {
 			/* Monitor by Accelerometer. */
-			PINFO("DEBUG [%s]: %5d %5d %5d, RST: %d/3 (%d), SKIP: %d",
-				MODEL_NAME,
-				client_data->acc_buffer[0] / 4,
-				client_data->acc_buffer[1] / 4,
-				client_data->acc_buffer[2] / 4,
-				client_data->cnt_reset,
-				client_data->cnt_total_reset,
-				client_data->skip_reset);
+#ifdef BHY_DEBUG
+			if (client_data->enable_irq_log) {
+				PINFO("DEBUG [%s]: %5d %5d %5d, RST: %d/3 (%d), SKIP: %d",
+					MODEL_NAME,
+					client_data->acc_buffer[0] / 4,
+					client_data->acc_buffer[1] / 4,
+					client_data->acc_buffer[2] / 4,
+					client_data->cnt_reset,
+					client_data->cnt_total_reset,
+					client_data->skip_reset);
 
-			PINFO("Monitor Info: %lld, %lld, %lld",
-				client_data->last_reset_time_buf[0],
-				client_data->last_reset_time_buf[1],
-				client_data->last_reset_time_buf[2]);
+				PINFO("Monitor Info: %lld, %lld, %lld",
+					client_data->last_reset_time_buf[0],
+					client_data->last_reset_time_buf[1],
+					client_data->last_reset_time_buf[2]);
+			}
+#endif /*~ BHY_DEBUG */
 
 			/** Check No event **/
 			if (!client_data->skip_reset &&
@@ -1554,7 +1576,17 @@ static int mcu_monitor_thread(void *arg)
 			}
 		}
 
-		msleep(10000);
+		/*
+		 * Poll every 10 s, but wake at once when the FIFO IRQ path has
+		 * force-disabled the IRQ (int_force_disable) so Reset#0 runs
+		 * within milliseconds rather than up to 10 s later. skip_reset
+		 * is part of the condition so a throttled hub cannot spin here.
+		 */
+		wait_event_interruptible_timeout(client_data->monitor_wq,
+			kthread_should_stop() ||
+			(client_data->irq_force_disabled &&
+				!client_data->skip_reset),
+			msecs_to_jiffies(10000));
 	}
 	return 0;
 }
@@ -1874,8 +1906,7 @@ void detect_init_event(struct bhy_client_data *client_data)
 		PDEBUG("Start up sequence error: Over sized FIFO");
 		return;
 	}
-	ret = bhy_read_reg(client_data, BHY_REG_FIFO_BUFFER_0,
-			data, bytes_remain);
+	ret = bhy_read_fifo_bytes(client_data, data, bytes_remain);
 	if (ret < 0) {
 		mutex_unlock(&client_data->mutex_bus_op);
 		PERR("Read fifo data failed");
@@ -1976,8 +2007,7 @@ void detect_self_test_event(struct bhy_client_data *client_data)
 		PDEBUG("Start up sequence error: Over sized FIFO");
 		return;
 	}
-	ret = bhy_read_reg(client_data, BHY_REG_FIFO_BUFFER_0,
-			data, bytes_remain);
+	ret = bhy_read_fifo_bytes(client_data, data, bytes_remain);
 	if (ret < 0) {
 		mutex_unlock(&client_data->mutex_bus_op);
 		PERR("Read fifo data failed");
@@ -2111,10 +2141,11 @@ static void bhy_read_fifo_data(struct bhy_client_data *client_data)
 		PERR("Read bytes remain reg failed");
 		/* i2c FIFO read failed: this is a level-high ONESHOT IRQ, so returning
 		 * here without quiescing it re-fires forever (~27us) and monopolises
-		 * mutex_bus_op, starving the mcu_monitor_thread recovery. Route through
-		 * int_debug() -- same as the zero-length path -- to disable_irq_nosync +
-		 * set irq_force_disabled so Reset#0 -> reset() can actually reload the FW. */
-		int_debug(client_data, "Read bytes remain reg failed",
+		 * mutex_bus_op. A failure here is never transient (bhy_i2c.c only
+		 * reports one after its retry loop, or while its breaker is armed),
+		 * so trip immediately instead of bleeding INT_DEBUG_COUNT fast-fails
+		 * first; the monitor thread then runs Reset#0 -> reset(). */
+		int_force_disable(client_data, "Read bytes remain reg failed",
 			__func__, __LINE__);
 		return;
 	}
@@ -2136,17 +2167,18 @@ static void bhy_read_fifo_data(struct bhy_client_data *client_data)
 		return;
 	}
 
-	ret = bhy_read_reg(client_data, BHY_REG_FIFO_BUFFER_0,
-			client_data->fifo_buf, bytes_remain);
+	ret = bhy_read_fifo_bytes(client_data, client_data->fifo_buf,
+			bytes_remain);
 	if (ret < 0) {
 		mutex_unlock(&client_data->mutex_bus_op);
 		PERR("Read fifo data failed");
 		/* i2c FIFO read failed: this is a level-high ONESHOT IRQ, so returning
 		 * here without quiescing it re-fires forever (~27us) and monopolises
-		 * mutex_bus_op, starving the mcu_monitor_thread recovery. Route through
-		 * int_debug() -- same as the zero-length path -- to disable_irq_nosync +
-		 * set irq_force_disabled so Reset#0 -> reset() can actually reload the FW. */
-		int_debug(client_data, "Read fifo data failed",
+		 * mutex_bus_op. A failure here is never transient (bhy_i2c.c only
+		 * reports one after its retry loop, or while its breaker is armed),
+		 * so trip immediately instead of bleeding INT_DEBUG_COUNT fast-fails
+		 * first; the monitor thread then runs Reset#0 -> reset(). */
+		int_force_disable(client_data, "Read fifo data failed",
 			__func__, __LINE__);
 		return;
 	}
@@ -5275,7 +5307,7 @@ static ssize_t bhy_store_req_fw(struct device *dev
 	}
 
 	/* Request firmware data */
-	ret = request_firmware(&fw, "bhi160b_ram_patch.fw", dev);
+	ret = request_firmware(&fw, BHY_RAM_PATCH_FW_NAME, dev);
 	if (ret < 0) {
 		PERR("Request firmware failed");
 		return -EIO;
@@ -5401,6 +5433,19 @@ static ssize_t bhy_store_req_fw(struct device *dev
 
 	mutex_unlock(&client_data->mutex_bus_op);
 	PINFO("Ram patch loaded successfully.");
+
+	/*
+	 * Arm the recovery machinery. mcu_monitor_thread parks in
+	 * wait_event(ram_patch_loaded) from probe until this flag is set, and
+	 * only bhy_load_ram_patch() (the recovery reloader) ever set it -- so
+	 * with the firmware loaded through this HAL-driven path the monitor
+	 * never ran once and every Reset#0..3 trigger was unreachable
+	 * (verified 2026-09-09: zero monitor output over a 2.8 h boot, and a
+	 * wedge that left the IRQ masked for good).
+	 */
+	client_data->last_acc_check_time = get_current_timestamp();
+	atomic_set(&client_data->ram_patch_loaded, RAM_PATCH_LOADED);
+	wake_up(&client_data->monitor_wq);
 
 	return count;
 }
