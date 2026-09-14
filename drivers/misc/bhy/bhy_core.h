@@ -274,6 +274,10 @@ struct bhy_client_data {
 
 	int ldo_enable_pin;
 	bool irq_force_disabled;
+	/* Hub stopped acking parameter requests; fail fast until reloaded. */
+	bool param_wedged;
+	/* Firmware has loaded at least once; the monitor stays armed after. */
+	bool hub_ever_loaded;
 };
 
 

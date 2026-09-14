@@ -129,6 +129,35 @@ static void int_debug(struct bhy_client_data *client_data,
 	}
 }
 
+/*
+ * A parameter request that is never acked means the hub firmware has stopped
+ * servicing the host interface, even though plain register I/O still works --
+ * so check_watchdog_reset() (chip status register, FIRMWARE_IDLE clear) keeps
+ * calling it healthy and no Reset# ever fires. Seen 2026-09-13 on 9c2e6b00:
+ * the hub went quiet ~50 s after boot and every later sensor_conf write
+ * burned the full ~2 s ack poll. WindowManager's orientation listener makes
+ * four of those on every screen wake while holding the lock keyguardGoingAway
+ * needs, so each unlock stalled ~7.6 s with touch frozen.
+ *
+ * Mark the hub wedged so every later parameter op fails at once instead of
+ * re-polling, and hand it to the monitor for Reset#0. bhy_load_ram_patch()
+ * clears the mark once the reload holds mutex_bus_op. Only force the IRQ off
+ * if it isn't already: disable_irq nests, and reset() re-enables it once.
+ */
+static void param_ack_timeout(struct bhy_client_data *client_data,
+	u8 page_num, u8 param_num, const char *func, int line)
+{
+	PERR("Wait for ack failed[%d, %d]", page_num, param_num);
+	if (client_data->param_wedged)
+		return;
+	client_data->param_wedged = true;
+	if (!client_data->irq_force_disabled)
+		int_force_disable(client_data, "parameter ack timeout",
+			func, line);
+	else
+		wake_up(&client_data->monitor_wq);
+}
+
 static void frame_debug(char *log, const char *func, int line)
 {
 	static int count;
@@ -191,6 +220,9 @@ static int bhy_read_parameter(struct bhy_client_data *client_data,
 	int retry = BHY_PARAM_ACK_WAIT_RETRY;
 	u8 ack, u8_val;
 
+	if (client_data->param_wedged)
+		return -EIO;
+
 	/* Select page */
 	ret = bhy_write_reg(client_data, BHY_REG_PARAM_PAGE_SEL, &page_num, 1);
 	if (ret < 0) {
@@ -219,7 +251,8 @@ static int bhy_read_parameter(struct bhy_client_data *client_data,
 		usleep_range(10000, 20000);
 	}
 	if (retry == -1) {
-		PERR("Wait for ack failed[%d, %d]", page_num, param_num);
+		param_ack_timeout(client_data, page_num, param_num,
+			__func__, __LINE__);
 		return -EINVAL;
 	}
 	/* Fetch param data */
@@ -250,6 +283,9 @@ static int bhy_write_parameter(struct bhy_client_data *client_data,
 	int ret;
 	int retry = BHY_PARAM_ACK_WAIT_RETRY;
 	u8 param_num_mod, ack, u8_val;
+
+	if (client_data->param_wedged)
+		return -EIO;
 
 	/* Write param data */
 	ret = bhy_write_reg(client_data, BHY_REG_LOAD_PARAM_0, data, len);
@@ -286,7 +322,8 @@ static int bhy_write_parameter(struct bhy_client_data *client_data,
 		usleep_range(10000, 20000);
 	}
 	if (retry == -1) {
-		PERR("Wait for ack failed[%d, %d]", page_num, param_num);
+		param_ack_timeout(client_data, page_num, param_num,
+			__func__, __LINE__);
 		return -EINVAL;
 	}
 	/* Clear up */
@@ -612,6 +649,8 @@ static int bhy_load_ram_patch(struct bhy_client_data *client_data)
 	 * through, the first failed op re-arms it.
 	 */
 	bhy_i2c_clear_degraded();
+	/* Same reasoning for the parameter-ack mark (param_ack_timeout()). */
+	client_data->param_wedged = false;
 
 	atomic_set(&client_data->ram_patch_loaded, RAM_PATCH_READY);
 	PINFO("Check : ram_patch_loaded = %d ",
@@ -852,6 +891,7 @@ static int bhy_load_ram_patch(struct bhy_client_data *client_data)
 	}
 
 	atomic_set(&client_data->ram_patch_loaded, RAM_PATCH_LOADED);
+	client_data->hub_ever_loaded = true;
 	PINFO("Check : ram_patch_loaded = %d ",
 		atomic_read(&client_data->ram_patch_loaded));
 
@@ -1453,9 +1493,19 @@ static int mcu_monitor_thread(void *arg)
 	client_data->cnt_no_response = 0;
 
 	while (likely(!kthread_should_stop())) {
-		/* run thread if ram_patch is loaded */
+		/*
+		 * Run once the firmware has loaded at least once. Gating every
+		 * pass on ram_patch_loaded parked this thread for good after a
+		 * single failed reload: every early return in
+		 * bhy_load_ram_patch() leaves it at RAM_PATCH_READY (0), so no
+		 * later Reset# could run. Seen 2026-09-13 on 9c2e6b00 -- IRQ
+		 * already force-disabled, no reset for ~7 h, until a manual
+		 * load_ram_patch set LOADED and Reset#0 fired within ms. Retries
+		 * stay bounded by cnt_reset/skip_reset (3 per RESET_TIMEOUT).
+		 */
 		wait_event_interruptible(client_data->monitor_wq,
 			kthread_should_stop() ||
+			client_data->hub_ever_loaded ||
 			atomic_read(&client_data->ram_patch_loaded));
 
 		ret = 0;
@@ -5445,6 +5495,7 @@ static ssize_t bhy_store_req_fw(struct device *dev
 	 */
 	client_data->last_acc_check_time = get_current_timestamp();
 	atomic_set(&client_data->ram_patch_loaded, RAM_PATCH_LOADED);
+	client_data->hub_ever_loaded = true;
 	wake_up(&client_data->monitor_wq);
 
 	return count;
