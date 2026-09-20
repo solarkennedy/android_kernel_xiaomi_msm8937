@@ -28,6 +28,7 @@
 #include <linux/input.h>
 #include <linux/workqueue.h>
 #include <linux/kthread.h>
+#include <linux/freezer.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
@@ -51,6 +52,14 @@ static s64 g_ts[4]; /* For fw load time test */
 /** Monitor Thread **/
 #define ACC_EVENT_TIMEOUT	15000000000ULL
 #define RESET_TIMEOUT		1800000000000ULL  /* 30 min */
+/*
+ * Consecutive failed chip-status polls before Reset#3. Three 10 s polls
+ * span 30 s, past the 15 s bhy_i2c breaker cooldown, so the deciding poll
+ * is a real bus attempt and not the breaker failing fast on the previous
+ * one's behalf. A real wedge is still caught in 30 s; a user-visible one
+ * is caught in ms by param_ack_timeout() regardless.
+ */
+#define BHY_MCU_STRIKES		3
 
 /*
  * Step detector / step counter source selection (pepito, 2026-07-23).
@@ -1431,36 +1440,34 @@ static int check_watchdog_reset(struct bhy_client_data *client_data)
 {
 	int ret = 0;
 	u8 reg_data = 0;
+
+	/*
+	 * Never while the AP is suspending. i2c-msm-v2 refuses every transfer
+	 * between its suspend_noirq and resume_noirq ("slave:0x28 is calling
+	 * xfer when system is suspended", -EIO) and one that straddles the
+	 * edge times out (-110); neither says anything about the hub. The
+	 * monitor is freezable now, so it normally cannot get here
+	 * mid-suspend -- this is the belt to that brace.
+	 */
+	if (atomic_read(&client_data->in_suspend))
+		return 0;
+
 	mutex_lock(&client_data->mutex_bus_op);
 	ret = bhy_read_reg(client_data, BHY_REG_CHIP_STATUS,
 		&reg_data, 1);
-
 	mutex_unlock(&client_data->mutex_bus_op);
 	if (ret < 0) {
 		/*
-		 * A failed status read used to be reported as "healthy"
-		 * (return 0, "Ignore reg_read fail"), which inverted the
-		 * only recovery trigger that survives a screen-off wedge:
-		 * Reset#0 needs int_debug(), which bhy_read_fifo_data()
-		 * never calls on its i2c-error paths, and Reset#1/#2 are
-		 * both gated behind acc_enabled. So when the hub stopped
-		 * answering with the screen off, this monitor woke every
-		 * 10s, failed this read, declared the hub fine, and did
-		 * nothing -- observed 2026-07-16 doing exactly that ~30
-		 * times in a row while the sensors stayed dead until a
-		 * reboot ([E]3BHY "Read bytes remain reg failed" spinning
-		 * on a level-high IRQ that can never be de-asserted,
-		 * because only draining the FIFO clears it).
-		 *
-		 * Not being able to read the status register is not
-		 * evidence of health -- it is the strongest evidence we
-		 * have of the opposite. This is not a transient blip
-		 * either: bhy_read_reg() only fails here after
-		 * BHY_MAX_RETRY_I2C_XFER full retries, or while the
-		 * bhy_i2c.c breaker is in cooldown -- and that cooldown
-		 * itself only arms after a whole retry loop has failed.
+		 * A failed status read is a strike. It used to be reported as
+		 * "healthy" (return 0, "Ignore reg_read fail"), which hid the
+		 * 2026-07-16 screen-off wedge from every Reset# for ~30 polls.
+		 * But one strike is not a verdict either: from 2026-09-09 to
+		 * 09-17 a single -5 here reset the hub at once, and every such
+		 * -5 in the 09-15 logs (13 in 2969 suspends: 7 resets, 0
+		 * FIRMWARE_IDLE) was this thread racing system suspend, never
+		 * the hub. The caller wants BHY_MCU_STRIKES in a row.
 		 */
-		PINFO("Read chip status failed (%d) -- treating as malfunction",
+		PINFO("Read chip status failed (%d) -- malfunction strike",
 			ret);
 		return 1;
 	}
@@ -1476,6 +1483,21 @@ static int check_watchdog_reset(struct bhy_client_data *client_data)
 	return ret;
 }
 
+/*
+ * The monitor is a freezable kthread. It polls the hub over i2c every 10 s
+ * whatever the system is doing, and until 2026-09-17 that included the
+ * window between i2c-msm-v2's suspend_noirq and resume_noirq, where the
+ * controller refuses every transfer (-EIO, "calling xfer when system is
+ * suspended") or times one out (-110). Each collision read as an MCU
+ * malfunction and reset a healthy hub; a reload that then straddled the
+ * next suspend failed the same way and left the hub without firmware until
+ * a later reload stuck. That was the entire "overnight crash loop" on
+ * 9c2e6b00: ~0.4 % of suspends collide with a 10 s poll (13 of 2969 on
+ * 09-15, 7 resets), and no log has ever shown FIRMWARE_IDLE. Freezing the
+ * thread with user space parks it before any device suspends and thaws it
+ * after every device has resumed; an in-flight reset()/reload holds the
+ * freezer, and so the suspend, until it completes instead of being torn.
+ */
 static int mcu_monitor_thread(void *arg)
 {
 	struct bhy_client_data *client_data = (struct bhy_client_data *)arg;
@@ -1483,6 +1505,8 @@ static int mcu_monitor_thread(void *arg)
 	int ret = 0;
 	int i;
 	bool duplication_detected = false;
+
+	set_freezable();
 
 	client_data->cnt_reset = 0;
 	client_data->skip_reset = false;
@@ -1503,7 +1527,7 @@ static int mcu_monitor_thread(void *arg)
 		 * load_ram_patch set LOADED and Reset#0 fired within ms. Retries
 		 * stay bounded by cnt_reset/skip_reset (3 per RESET_TIMEOUT).
 		 */
-		wait_event_interruptible(client_data->monitor_wq,
+		wait_event_freezable(client_data->monitor_wq,
 			kthread_should_stop() ||
 			client_data->hub_ever_loaded ||
 			atomic_read(&client_data->ram_patch_loaded));
@@ -1602,10 +1626,21 @@ static int mcu_monitor_thread(void *arg)
 			/* Reset by MCU Watchdog. */
 			if (check_watchdog_reset(client_data)) {
 				client_data->cnt_no_response++;
-				PINFO("MCU Malfunction Detected. %d/3", client_data->cnt_no_response);
+				PINFO("MCU Malfunction Detected. %d/%d",
+					client_data->cnt_no_response,
+					BHY_MCU_STRIKES);
+			} else {
+				/*
+				 * A passing poll clears the count. Strikes used to
+				 * accumulate through a skip_reset backoff and fire
+				 * a reset the moment it lifted, hours after the
+				 * hub had answered again (09-15 12:26, 19:04).
+				 */
+				client_data->cnt_no_response = 0;
 			}
 
-			if (!client_data->skip_reset && (client_data->cnt_no_response > 0)) {
+			if (!client_data->skip_reset &&
+				client_data->cnt_no_response >= BHY_MCU_STRIKES) {
 				PINFO("MCU Malfunction Detected, Try to Reset#3");
 				reset(client_data);
 				client_data->last_reset_time = tmp_timestamp;
@@ -1632,7 +1667,7 @@ static int mcu_monitor_thread(void *arg)
 		 * within milliseconds rather than up to 10 s later. skip_reset
 		 * is part of the condition so a throttled hub cannot spin here.
 		 */
-		wait_event_interruptible_timeout(client_data->monitor_wq,
+		wait_event_freezable_timeout(client_data->monitor_wq,
 			kthread_should_stop() ||
 			(client_data->irq_force_disabled &&
 				!client_data->skip_reset),
@@ -7866,6 +7901,7 @@ int bhy_suspend(struct device *dev)
 #endif /*~ BHY_TS_LOGGING_SUPPORT */
 
 	PINFO("Enter suspend");
+	client_data->irq_wake_armed = false;
 
 	if (client_data->step_det_enabled || client_data->step_cnt_enabled) {
 		if (!client_data->pedo_enabled) {
@@ -7891,7 +7927,14 @@ int bhy_suspend(struct device *dev)
 	}
 	mutex_unlock(&client_data->mutex_bus_op);
 
-	if (!client_data->irq_force_disabled)
+	/*
+	 * Record whether the wake source was actually armed:
+	 * irq_force_disabled can flip in the IRQ thread between the noirq
+	 * resume stage and bhy_resume(), so the resume side must undo
+	 * exactly what happened here or the wake refcount drifts.
+	 */
+	client_data->irq_wake_armed = !client_data->irq_force_disabled;
+	if (client_data->irq_wake_armed)
 		enable_irq_wake(client_data->data_bus.irq);
 
 	atomic_set(&client_data->in_suspend, 1);
@@ -7926,6 +7969,7 @@ int bhy_resume(struct device *dev)
 {
 	struct bhy_client_data *client_data = dev_get_drvdata(dev);
 	int ret;
+	int bus_ret = 0;
 	u8 data;
 #ifdef BHY_TS_LOGGING_SUPPORT
 	struct frame_queue *q = &client_data->data_queue;
@@ -7936,32 +7980,41 @@ int bhy_resume(struct device *dev)
 	/** Monitor Thread **/
 	client_data->last_acc_check_time = get_current_timestamp();
 
-	if (!client_data->irq_force_disabled)
+	if (client_data->irq_wake_armed) {
 		disable_irq_wake(client_data->data_bus.irq);
+		client_data->irq_wake_armed = false;
+	}
 
+	/*
+	 * A bus error here must not abort the bookkeeping below. The early
+	 * returns this used to take left in_suspend set for good, so the IRQ
+	 * thread treated every later FIFO drain as a mid-suspend event (extra
+	 * wakelock + 20 ms) and the next bhy_suspend() re-armed nothing.
+	 * Seen 2026-09-17 on c39a6acf: the flush write failed with -5 (the
+	 * bhy_i2c breaker was armed by a monitor read that had raced the
+	 * suspend) and bhy_pm_op_resume returned -5. The error is still
+	 * returned at the end so the PM core logs it.
+	 */
 	mutex_lock(&client_data->mutex_bus_op);
 	ret = bhy_read_reg(client_data, BHY_REG_HOST_CTRL, &data, 1);
 	if (ret < 0) {
-		mutex_unlock(&client_data->mutex_bus_op);
 		PERR("Read host ctrl reg failed");
-		return -EIO;
+	} else {
+		data &= ~HOST_CTRL_MASK_AP_SUSPENDED;
+		ret = bhy_write_reg(client_data, BHY_REG_HOST_CTRL, &data, 1);
+		if (ret < 0)
+			PERR("Write host ctrl reg failed");
 	}
-	data &= ~HOST_CTRL_MASK_AP_SUSPENDED;
-	ret = bhy_write_reg(client_data, BHY_REG_HOST_CTRL, &data, 1);
-	if (ret < 0) {
-		mutex_unlock(&client_data->mutex_bus_op);
-		PERR("Write host ctrl reg failed");
-		return -EIO;
-	}
-	/* Flush all sensor data */
-	data = 0xFF;
-	ret = bhy_write_reg(client_data, BHY_REG_FIFO_FLUSH, &data, 1);
-	if (ret < 0) {
-		mutex_unlock(&client_data->mutex_bus_op);
-		PERR("Write flush sensor reg error");
-		return ret;
+	if (ret >= 0) {
+		/* Flush all sensor data */
+		data = 0xFF;
+		ret = bhy_write_reg(client_data, BHY_REG_FIFO_FLUSH, &data, 1);
+		if (ret < 0)
+			PERR("Write flush sensor reg error");
 	}
 	mutex_unlock(&client_data->mutex_bus_op);
+	if (ret < 0)
+		bus_ret = ret;
 
 	atomic_set(&client_data->in_suspend, 0);
 
@@ -7996,7 +8049,7 @@ int bhy_resume(struct device *dev)
 		}
 	}
 
-	return 0;
+	return bus_ret;
 }
 EXPORT_SYMBOL(bhy_resume);
 #endif /*~ CONFIG_PM */

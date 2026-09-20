@@ -278,6 +278,8 @@ struct bhy_client_data {
 	bool param_wedged;
 	/* Firmware has loaded at least once; the monitor stays armed after. */
 	bool hub_ever_loaded;
+	/* bhy_suspend() armed the FIFO IRQ as a wake source; resume undoes it. */
+	bool irq_wake_armed;
 };
 
 
