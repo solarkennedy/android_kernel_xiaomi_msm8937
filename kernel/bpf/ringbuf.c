@@ -63,7 +63,19 @@ struct bpf_ringbuf_hdr {
 
 static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
 {
-	const gfp_t flags = GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL |
+	/*
+	 * NOT GFP_KERNEL_ACCOUNT: on 4.19, memcg kmem accounting marks each
+	 * charged page with the PG_kmemcg page_type, and page_type is a union
+	 * with _mapcount. These pages get mmap()ed into user space
+	 * (remap_vmalloc_range -> vm_insert_page -> page_add_file_rmap), so the
+	 * first mapping turns page_type 0xfffffdff into 0xfffffe00, which
+	 * satisfies PageBuddy(). The allocator then finds an "unlinked buddy"
+	 * with a poisoned lru (list_del corruption in move_freepages_block),
+	 * or a buddy with a non-zero refcount, and unmapping underflows the
+	 * mapcount (BUG: Bad page map). Upstream only added memcg accounting
+	 * here after page->memcg_data replaced the PG_kmemcg page_type (5.11).
+	 */
+	const gfp_t flags = GFP_KERNEL | __GFP_RETRY_MAYFAIL |
 			    __GFP_NOWARN | __GFP_ZERO;
 	int nr_meta_pages = RINGBUF_PGOFF + RINGBUF_POS_PAGES;
 	int nr_data_pages = data_sz >> PAGE_SHIFT;
