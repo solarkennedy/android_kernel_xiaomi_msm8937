@@ -301,7 +301,7 @@ static void *__bpf_map_area_alloc(u64 size, int numa_node, bool mmapable)
 	 * __GFP_RETRY_MAYFAIL to avoid such situations.
 	 */
 
-	const gfp_t gfp = __GFP_NOWARN | __GFP_ZERO | __GFP_ACCOUNT;
+	gfp_t gfp = __GFP_NOWARN | __GFP_ZERO | __GFP_ACCOUNT;
 	unsigned int flags = 0;
 	unsigned long align = 1;
 	void *area;
@@ -314,6 +314,13 @@ static void *__bpf_map_area_alloc(u64 size, int numa_node, bool mmapable)
 		BUG_ON(!PAGE_ALIGNED(size));
 		align = SHMLBA;
 		flags = VM_USERMAP;
+		/*
+		 * Pages that are mmap()ed to user space must not be kmem-charged
+		 * on 4.19: PG_kmemcg lives in page_type, which aliases _mapcount,
+		 * so a mapped charged page reads as PageBuddy(). See the note in
+		 * bpf_ringbuf_area_alloc().
+		 */
+		gfp &= ~__GFP_ACCOUNT;
 	} else if (size <= (PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER)) {
 		area = kmalloc_node(size, gfp | GFP_USER | __GFP_NORETRY,
 				    numa_node);
