@@ -1157,6 +1157,9 @@ static __always_inline bool free_pages_prepare(struct page *page,
 	int bad = 0;
 
 	VM_BUG_ON_PAGE(PageTail(page), page);
+	/* list_del hunt: catch a double free at the second free, with the
+	 * first free's stack from page_owner. */
+	VM_BUG_ON_PAGE(PageBuddy(page), page);
 
 	trace_mm_page_free(page, order);
 
@@ -2220,6 +2223,19 @@ static int move_freepages(struct zone *zone,
 		}
 
 		order = page_order(page);
+		/*
+		 * list_del hunt: a PageBuddy page whose lru was already
+		 * list_del'd (poisoned) is the bug we are chasing. Name the
+		 * page (owner + last free stack) before __list_del_entry_valid
+		 * BUGs on it.
+		 */
+		if (unlikely(page->lru.next == LIST_POISON1 ||
+			     page->lru.prev == LIST_POISON2)) {
+			pr_emerg("move_freepages: pfn %#lx order %u mt %d has poisoned lru (%px/%px)\n",
+				 page_to_pfn(page), order, migratetype,
+				 page->lru.next, page->lru.prev);
+			dump_page(page, "poisoned lru on buddy freelist");
+		}
 		list_move(&page->lru,
 			  &zone->free_area[order].free_list[migratetype]);
 		page += 1 << order;

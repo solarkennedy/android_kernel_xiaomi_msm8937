@@ -91,6 +91,8 @@ _kgsl_pool_get_page(struct kgsl_page_pool *pool)
 	if (pool->page_count) {
 		p = list_first_entry(&pool->page_list, struct page, lru);
 		pool->page_count--;
+		/* list_del hunt: a pooled page must not be on a buddy freelist */
+		VM_BUG_ON_PAGE(PageBuddy(p), p);
 		list_del(&p->lru);
 	}
 	spin_unlock(&pool->list_lock);

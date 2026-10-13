@@ -122,6 +122,8 @@ static struct page *ion_page_pool_remove(struct ion_page_pool *pool, bool high)
 	}
 
 	atomic_dec(&pool->count);
+	/* list_del hunt: a pooled page must not be on a buddy freelist */
+	VM_BUG_ON_PAGE(PageBuddy(page), page);
 	list_del(&page->lru);
 	nr_total_pages -= 1 << pool->order;
 	mod_node_page_state(page_pgdat(page), NR_KERNEL_MISC_RECLAIMABLE,

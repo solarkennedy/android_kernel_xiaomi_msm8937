@@ -26,6 +26,7 @@ struct page_owner {
 	short last_migrate_reason;
 	gfp_t gfp_mask;
 	depot_stack_handle_t handle;
+	depot_stack_handle_t free_handle;
 	int pid;
 	u64 ts_nsec;
 	u64 free_ts_nsec;
@@ -116,17 +117,23 @@ static inline struct page_owner *get_page_owner(struct page_ext *page_ext)
 	return (void *)page_ext + page_owner_ops.offset;
 }
 
+static noinline depot_stack_handle_t save_stack(gfp_t flags);
+
 void __reset_page_owner(struct page *page, unsigned int order)
 {
 	int i;
 	struct page_ext *page_ext;
 	u64 free_ts_nsec = local_clock();
+	/* list_del hunt: keep the freeing stack so dump_page() on a free page
+	 * can say who last gave it back to the buddy allocator. */
+	depot_stack_handle_t free_handle = save_stack(GFP_NOWAIT | __GFP_NOWARN);
 
 	for (i = 0; i < (1 << order); i++) {
 		page_ext = lookup_page_ext(page + i);
 		if (unlikely(!page_ext))
 			continue;
 		get_page_owner(page_ext)->free_ts_nsec = free_ts_nsec;
+		get_page_owner(page_ext)->free_handle = free_handle;
 		__clear_bit(PAGE_EXT_OWNER, &page_ext->flags);
 		__set_bit(PAGE_EXT_PG_FREE, &page_ext->flags);
 	}
@@ -194,6 +201,7 @@ static inline void __set_page_owner_handle(struct page_ext *page_ext,
 	page_owner->pid = current->pid;
 	page_owner->ts_nsec = local_clock();
 	page_owner->free_ts_nsec = 0;
+	page_owner->free_handle = 0;
 
 	__set_bit(PAGE_EXT_OWNER, &page_ext->flags);
 	__clear_bit(PAGE_EXT_PG_FREE, &page_ext->flags);
@@ -462,14 +470,15 @@ void __dump_page_owner(struct page *page)
 	gfp_mask = page_owner->gfp_mask;
 	mt = gfpflags_to_migratetype(gfp_mask);
 
-	if (!test_bit(PAGE_EXT_OWNER, &page_ext->flags)) {
-		pr_alert("page_owner info is not active (free page?)\n");
-		return;
-	}
+	/* list_del hunt: the alloc handle survives the free, so report a free
+	 * page's LAST owner instead of giving up. */
+	if (!test_bit(PAGE_EXT_OWNER, &page_ext->flags))
+		pr_alert("page_owner: page is FREE (PG_FREE=%d), last owner follows\n",
+			 !!test_bit(PAGE_EXT_PG_FREE, &page_ext->flags));
 
 	handle = READ_ONCE(page_owner->handle);
 	if (!handle) {
-		pr_alert("page_owner info is not active (free page?)\n");
+		pr_alert("page_owner info is not active (never allocated?)\n");
 		return;
 	}
 
@@ -482,6 +491,15 @@ void __dump_page_owner(struct page *page)
 	if (page_owner->last_migrate_reason != -1)
 		pr_alert("page has been migrated, last migrate reason: %s\n",
 			migrate_reason_names[page_owner->last_migrate_reason]);
+
+	handle = READ_ONCE(page_owner->free_handle);
+	if (handle) {
+		trace.nr_entries = 0;
+		depot_fetch_stack(handle, &trace);
+		pr_alert("page last freed at ts %llu ns via\n",
+			 page_owner->free_ts_nsec);
+		print_stack_trace(&trace, 0);
+	}
 }
 
 static ssize_t
