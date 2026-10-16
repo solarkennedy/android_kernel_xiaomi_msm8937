@@ -4392,9 +4392,12 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 	int scanned;
 	int reclaimed;
 	LIST_HEAD(list);
+	LIST_HEAD(clean);
 	struct page *page;
+	struct page *next;
 	enum vm_event_item item;
 	struct lru_gen_mm_walk *walk;
+	bool skip_retry = false;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
@@ -4412,21 +4415,34 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 
 	if (list_empty(&list))
 		return scanned;
-
+retry:
 	reclaimed = shrink_page_list(&list, pgdat, sc, 0, NULL, false);
+	sc->nr_reclaimed += reclaimed;
 
 	/*
 	 * To avoid livelock, don't add rejected pages back to the same lists
 	 * they were isolated from. See lru_gen_add_page().
 	 */
-	list_for_each_entry(page, &list, lru) {
-		ClearPageReferenced(page);
-		ClearPageWorkingset(page);
-
-		if (PageReclaim(page) && (PageDirty(page) || PageWriteback(page)))
+	list_for_each_entry_safe_reverse(page, next, &list, lru) {
+		if (PageReclaim(page) && (PageDirty(page) || PageWriteback(page))) {
+			ClearPageReferenced(page);
+			ClearPageWorkingset(page);
 			ClearPageActive(page);
-		else
+			continue;
+		}
+
+		if (skip_retry || PageActive(page) || PageReferenced(page) ||
+		    page_mapped(page) || PageLocked(page) ||
+		    PageDirty(page) || PageWriteback(page)) {
+			ClearPageReferenced(page);
+			ClearPageWorkingset(page);
 			SetPageActive(page);
+			continue;
+		}
+
+		/* retry pages that may have missed rotate_reclaimable_page() */
+		list_move(&page->lru, &clean);
+		sc->nr_scanned -= hpage_nr_pages(page);
 	}
 
 	spin_lock_irq(&pgdat->lru_lock);
@@ -4447,7 +4463,13 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 	mem_cgroup_uncharge_list(&list);
 	free_unref_page_list(&list);
 
-	sc->nr_reclaimed += reclaimed;
+	INIT_LIST_HEAD(&list);
+	list_splice_init(&clean, &list);
+
+	if (!list_empty(&list)) {
+		skip_retry = true;
+		goto retry;
+	}
 
 	if (type == LRU_GEN_ANON && swapped)
 		*swapped = true;
