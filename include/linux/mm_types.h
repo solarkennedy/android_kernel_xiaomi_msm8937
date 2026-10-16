@@ -587,9 +587,12 @@ static inline void lru_gen_init_mm(struct mm_struct *mm)
 
 static inline void lru_gen_use_mm(struct mm_struct *mm)
 {
-	/* unlikely but not a bug when racing with lru_gen_migrate_mm() */
-	VM_WARN_ON(list_empty(&mm->lru_gen.list));
-
+	/*
+	 * The list node is momentarily empty while lru_gen_migrate_mm() moves
+	 * the mm between memcgs; v10 carried a VM_WARN_ON here that fires on
+	 * every memcg migration Android does for new processes (twice per
+	 * boot on pepito under DEBUG_VM). Upstream dropped the check.
+	 */
 	if (!(current->flags & PF_KTHREAD) && !nodes_full(mm->lru_gen.nodes))
 		nodes_setall(mm->lru_gen.nodes);
 }
