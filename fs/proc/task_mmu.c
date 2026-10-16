@@ -1765,6 +1765,17 @@ cont:
 		if (!page)
 			continue;
 
+		/*
+		 * Pages on the unevictable list (mlocked by this or any other
+		 * mapper, e.g. a shared library page) must not reach
+		 * shrink_page_list(): page_evictable() sends them to keep:,
+		 * which trips VM_BUG_ON_PAGE(PageUnevictable) under DEBUG_VM
+		 * and is a pointless isolate/putback otherwise. Upstream
+		 * MADV_PAGEOUT sidesteps this by skipping shared pages.
+		 */
+		if (PageUnevictable(page))
+			continue;
+
 		if (isolate_lru_page(compound_head(page)))
 			continue;
 
