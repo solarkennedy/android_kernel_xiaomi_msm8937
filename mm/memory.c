@@ -2866,9 +2866,7 @@ static void lru_gen_swap_refault(struct page *page, swp_entry_t entry)
 	if (!lru_gen_enabled())
 		return;
 
-	rcu_read_lock();
-	item = radix_tree_lookup(&mapping->i_pages, index);
-	rcu_read_unlock();
+	item = xa_load(&mapping->i_pages, index);
 	if (xa_is_value(item))
 		lru_gen_refault(page, item);
 }
