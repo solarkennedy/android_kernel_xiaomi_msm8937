@@ -2761,7 +2761,10 @@ void lru_gen_migrate_mm(struct mm_struct *mm)
 	if (memcg == mm->lru_gen.memcg)
 		return;
 
-	VM_BUG_ON_MM(!mm->lru_gen.memcg, mm);
+	/* migration can happen before addition */
+	if (!mm->lru_gen.memcg)
+		return;
+
 	VM_BUG_ON_MM(list_empty(&mm->lru_gen.list), mm);
 
 	lru_gen_del_mm(mm);
